@@ -1,0 +1,29 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - SNOWFLAKE_MOCK_MODE=${SNOWFLAKE_MOCK_MODE:-true}
+      - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT:-}
+      - SNOWFLAKE_USER=${SNOWFLAKE_USER:-}
+      - SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD:-}
+      - SNOWFLAKE_PRIVATE_KEY_PATH=${SNOWFLAKE_PRIVATE_KEY_PATH:-}
+      - SNOWFLAKE_ROLE=${SNOWFLAKE_ROLE:-RBT_PLATFORM_ROLE}
+      - SNOWFLAKE_DATABASE=${SNOWFLAKE_DATABASE:-RBT_GLOBAL_PLATFORM}
+      - SNOWFLAKE_SCHEMA=${SNOWFLAKE_SCHEMA:-CORE}
+      - SNOWFLAKE_WAREHOUSE=${SNOWFLAKE_WAREHOUSE:-RBT_DEFAULT_WH}
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
