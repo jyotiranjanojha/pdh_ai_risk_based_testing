@@ -149,7 +149,7 @@ sequenceDiagram
     API->>Guard: Wrap __TARGET_DATASET__ (override) & __BASELINE_DATASET__ (PROD) CTEs
     API->>SF: Execute APPROVED rules on team warehouse
     SF-->>API: Failed row counts + up to 5 sample keys
-    API->>SF: Compute Coverage % & Release Confidence Score; persist RBT_EXECUTION_RUNS
+    API->>SF: Compute Coverage Pct and Release Confidence Score, persist RBT_EXECUTION_RUNS
     API-->>UI: Gate Decision (PASS / BLOCKED_DOWNSTREAM) + Scorecard + AI Triage Summary
 ```
 
