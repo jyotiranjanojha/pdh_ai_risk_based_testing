@@ -9,6 +9,7 @@ from app.schemas.models import (
     DomainCreate,
     DomainOut,
     GroundingContext,
+    RebaselineResponse,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["Domains & Grounding"])
@@ -18,6 +19,12 @@ def row_to_domain_out(row: dict) -> DomainOut:
     related = row.get("RELATED_TABLES")
     if isinstance(related, str):
         related = json.loads(related)
+    baseline = row.get("BASELINE_SCHEMA_JSON")
+    if isinstance(baseline, str) and baseline:
+        try:
+            baseline = json.loads(baseline)
+        except Exception:
+            baseline = None
     return DomainOut(
         domain_id=row["DOMAIN_ID"],
         team_id=row["TEAM_ID"],
@@ -31,6 +38,9 @@ def row_to_domain_out(row: dict) -> DomainOut:
         downstream_consumer=row.get("DOWNSTREAM_CONSUMER"),
         business_context=row.get("BUSINESS_CONTEXT"),
         criticality=row.get("CRITICALITY") or "HIGH",
+        baseline_schema_json=baseline if isinstance(baseline, list) else None,
+        upstream_source_table=row.get("UPSTREAM_SOURCE_TABLE"),
+        transformation_sql=row.get("TRANSFORMATION_SQL"),
         is_active=bool(row.get("IS_ACTIVE", True)),
         created_ts=row["CREATED_TS"],
     )
@@ -78,3 +88,22 @@ async def get_domain_grounding(
     if not team:
         raise HTTPException(status_code=404, detail="Parent team not found.")
     return sf_client.ground_domain_metadata(team, domain)
+
+
+@router.post("/domains/{domain_id}/rebaseline", response_model=RebaselineResponse)
+async def rebaseline_domain_schema(
+    domain_id: str,
+    user: CurrentUser = Depends(require_role("APPROVER")),
+):
+    domain = sf_client.get_domain(domain_id)
+    if not domain:
+        raise HTTPException(status_code=404, detail=f"Domain '{domain_id}' not found.")
+    team = sf_client.get_team(domain["TEAM_ID"])
+    if not team:
+        raise HTTPException(status_code=404, detail="Parent team not found.")
+    snapshot = sf_client.rebaseline_domain_schema(team, domain)
+    return RebaselineResponse(
+        domain_id=domain_id,
+        column_count=len(snapshot),
+        baseline_schema_json=snapshot,
+    )

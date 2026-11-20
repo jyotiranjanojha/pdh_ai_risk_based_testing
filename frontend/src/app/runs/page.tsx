@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { useAppContext } from "@/components/AppContext";
 import { GateDecisionBadge, PriorityBadge } from "@/components/RoleBadge";
-import { Domain, ExecutionRun, rbtApi } from "@/lib/api";
+import { Domain, EnvironmentType, ExecutionRun, rbtApi } from "@/lib/api";
 
 export default function RunsTriagePage() {
   const { activeTeamId, authHeaders, role, cortexModel } = useAppContext();
@@ -25,7 +25,14 @@ export default function RunsTriagePage() {
   const [trigDomainId, setTrigDomainId] = useState("");
   const [trigMode, setTrigMode] = useState<"SYNC" | "ASYNC">("SYNC");
   const [trigCycle, setTrigCycle] = useState("2025_W42_POR");
+  const [trigEnv, setTrigEnv] = useState<EnvironmentType>("PROD");
+  const [trigSchemaOverride, setTrigSchemaOverride] = useState("");
   const [triggering, setTriggering] = useState(false);
+  const [triggerErr, setTriggerErr] = useState<string | null>(null);
+
+  // Re-Baseline Schema (Scope 2)
+  const [rebaselining, setRebaselining] = useState(false);
+  const [rebaselineMsg, setRebaselineMsg] = useState<string | null>(null);
 
   // Break-Glass Override Modal
   const [overrideOpen, setOverrideOpen] = useState(false);
@@ -76,6 +83,7 @@ export default function RunsTriagePage() {
   const handleTriggerGate = async (e: React.FormEvent) => {
     e.preventDefault();
     setTriggering(true);
+    setTriggerErr(null);
     try {
       const res = await rbtApi.runGate(authHeaders, {
         team_id: activeTeamId,
@@ -84,12 +92,30 @@ export default function RunsTriagePage() {
         execution_mode: trigMode,
         planning_cycle_id: trigCycle || undefined,
         cortex_model: cortexModel,
+        environment: trigEnv,
+        target_schema_override: trigSchemaOverride.trim() || undefined,
       });
       setTriggerOpen(false);
       await loadData();
       setSelectedRun(res);
+    } catch (err) {
+      setTriggerErr(err instanceof Error ? err.message : "Gate execution failed");
     } finally {
       setTriggering(false);
+    }
+  };
+
+  const handleRebaseline = async () => {
+    if (!selectedRun) return;
+    setRebaselining(true);
+    setRebaselineMsg(null);
+    try {
+      const res = await rbtApi.rebaselineDomain(authHeaders, selectedRun.domain_id);
+      setRebaselineMsg(`Schema contract re-baselined (${res.column_count} columns snapshotted).`);
+    } catch (err) {
+      setRebaselineMsg(err instanceof Error ? err.message : "Re-baseline failed");
+    } finally {
+      setRebaselining(false);
     }
   };
 
@@ -143,10 +169,15 @@ export default function RunsTriagePage() {
                 <span className="font-mono text-xs font-bold">{r.run_id}</span>
                 <GateDecisionBadge decision={r.gate_decision} />
               </div>
-              <div className="mt-1.5 text-xs font-medium">{r.domain_name || r.domain_id}</div>
+              <div className="mt-1.5 flex items-center gap-2 text-xs font-medium">
+                <span>{r.domain_name || r.domain_id}</span>
+                <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] dark:bg-slate-800">
+                  {r.environment || "PROD"}
+                </span>
+              </div>
               <div className="mt-1 flex items-center justify-between text-[11px] text-slate-500">
                 <span>Cycle: {r.planning_cycle_id || "ALL"}</span>
-                <span>{r.triggered_by}</span>
+                <span>Confidence: {(r.release_confidence_score ?? 100).toFixed(0)}%</span>
               </div>
             </button>
           ))}
@@ -168,8 +199,14 @@ export default function RunsTriagePage() {
                     )}
                   </div>
                   <div className="mt-1 text-xs text-slate-500">
-                    Dataset: {selectedRun.domain_name || selectedRun.domain_id} · Cycle:{" "}
-                    <span className="font-mono">{selectedRun.planning_cycle_id || "ALL"}</span> · Duration:{" "}
+                    Dataset: {selectedRun.domain_name || selectedRun.domain_id} · Env:{" "}
+                    <span className="font-mono font-semibold">{selectedRun.environment || "PROD"}</span>
+                    {selectedRun.target_schema_override && (
+                      <>
+                        {" "}· Override: <span className="font-mono">{selectedRun.target_schema_override}</span>
+                      </>
+                    )}
+                    {" "}· Cycle: <span className="font-mono">{selectedRun.planning_cycle_id || "ALL"}</span> · Duration:{" "}
                     {selectedRun.metrics.duration_ms} ms
                   </div>
                 </div>
@@ -185,6 +222,52 @@ export default function RunsTriagePage() {
                   </button>
                 )}
               </div>
+
+              {/* Release Confidence & Step-0 Schema Contract Scorecard (Scopes 1 & 2) */}
+              <div className="grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3.5 text-xs dark:border-slate-800 dark:bg-slate-950 sm:grid-cols-3">
+                <div>
+                  <div className="text-[11px] text-slate-500">Release Confidence Score</div>
+                  <div className="mt-0.5 text-lg font-bold text-blue-500">
+                    {(selectedRun.release_confidence_score ?? selectedRun.metrics.release_confidence_score ?? 100).toFixed(1)}%
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-slate-500">Column Test Coverage</div>
+                  <div className="mt-0.5 text-lg font-bold">
+                    {(selectedRun.coverage_pct ?? selectedRun.metrics.coverage_pct ?? 0).toFixed(1)}%
+                  </div>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <div className="text-[11px] text-slate-500">Step-0 Schema Contract</div>
+                    <span
+                      className={`mt-1 inline-block rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                        selectedRun.schema_drift_status === "DRIFT_DETECTED"
+                          ? "bg-rose-500/15 text-rose-500"
+                          : "bg-emerald-500/15 text-emerald-500"
+                      }`}
+                    >
+                      {selectedRun.schema_drift_status || "PASS"}
+                    </span>
+                  </div>
+                  {canOverride && (
+                    <button
+                      type="button"
+                      onClick={handleRebaseline}
+                      disabled={rebaselining}
+                      className="rounded-lg border border-slate-300 px-2.5 py-1 text-[11px] font-semibold hover:bg-slate-200 disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800"
+                    >
+                      {rebaselining ? "Snapshotting..." : "Re-Baseline"}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {rebaselineMsg && (
+                <div className="rounded-lg border border-blue-500/30 bg-blue-500/10 p-2.5 text-xs text-blue-400">
+                  {rebaselineMsg}
+                </div>
+              )}
 
               {/* Cortex AI Triage Banner */}
               {selectedRun.ai_triage_summary && (
@@ -300,6 +383,32 @@ export default function RunsTriagePage() {
                 />
               </div>
             </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="mb-1 block text-xs font-medium text-slate-500">Environment</label>
+                <select
+                  value={trigEnv}
+                  onChange={(e) => setTrigEnv(e.target.value as EnvironmentType)}
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-800"
+                >
+                  <option value="PROD">PROD</option>
+                  <option value="UAT">UAT</option>
+                  <option value="DEV">DEV</option>
+                </select>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-slate-500">Target Schema Override</label>
+                <input
+                  value={trigSchemaOverride}
+                  onChange={(e) => setTrigSchemaOverride(e.target.value)}
+                  placeholder="PDH_UAT_DB.PR_1042"
+                  className="w-full rounded-lg border border-slate-300 bg-transparent px-3 py-2 font-mono text-xs dark:border-slate-700"
+                />
+              </div>
+            </div>
+            {triggerErr && (
+              <div className="rounded bg-rose-500/10 p-2 text-xs text-rose-400">{triggerErr}</div>
+            )}
             <button
               type="submit"
               disabled={triggering}

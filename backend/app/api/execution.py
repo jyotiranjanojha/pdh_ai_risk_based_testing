@@ -2,9 +2,10 @@ import asyncio
 import csv
 import io
 import json
+import re
 import time
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -21,21 +22,62 @@ from app.schemas.models import (
     RunGateResponse,
     RunMetricsOut,
 )
+from app.security.sql_validator import SQLValidationError, sanitize_sql_identifier
 
 router = APIRouter(prefix="/api/v1", tags=["Execution Gate & Triage"])
 
 _BACKGROUND_TASKS: set = set()
 
 
-def _parse_sample_keys(raw: Any) -> List[Dict[str, Any]]:
+def _parse_json_list(raw: Any) -> List[Dict[str, Any]]:
     if isinstance(raw, list):
         return raw
     if isinstance(raw, str) and raw:
         try:
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
         except Exception:
             return []
     return []
+
+
+def compute_release_confidence_and_coverage(
+    domain: Dict[str, Any],
+    approved_rules: List[Dict[str, Any]],
+    schema_drift_status: str,
+    p1_failures: int,
+    p2_failures: int,
+) -> Tuple[float, float]:
+    """Compute (coverage_pct, release_confidence_score) in [0.0, 100.0]."""
+    baseline_cols = _parse_json_list(domain.get("BASELINE_SCHEMA_JSON"))
+    all_sql = "\n".join(r.get("VALIDATION_SQL") or "" for r in approved_rules)
+
+    if baseline_cols and approved_rules:
+        covered = sum(
+            1
+            for col in baseline_cols
+            if col.get("column_name")
+            and re.search(rf"\b{re.escape(str(col['column_name']))}\b", all_sql, re.IGNORECASE)
+        )
+        # If rules only use SELECT *, ensure non-zero baseline credit
+        if covered == 0 and all_sql.strip():
+            covered = min(len(baseline_cols), len(approved_rules))
+        coverage_pct = round(min(100.0, (covered / max(len(baseline_cols), 1)) * 100.0), 1)
+    elif approved_rules:
+        coverage_pct = round(min(100.0, len(approved_rules) * 20.0), 1)
+    else:
+        coverage_pct = 0.0
+
+    if not approved_rules and schema_drift_status != "DRIFT_DETECTED":
+        return coverage_pct, 0.0
+
+    score = 100.0
+    if schema_drift_status == "DRIFT_DETECTED":
+        score -= 40.0
+    score -= p1_failures * 25.0
+    score -= p2_failures * 10.0
+    score = max(0.0, min(100.0, round(score * (0.7 + 0.3 * (coverage_pct / 100.0)), 1)))
+    return coverage_pct, score
 
 
 def _build_run_response(run: Dict[str, Any], details: List[Dict[str, Any]]) -> RunGateResponse:
@@ -49,7 +91,7 @@ def _build_run_response(run: Dict[str, Any], details: List[Dict[str, Any]]) -> R
         failed_cnt = int(d.get("FAILED_ROW_COUNT") or 0)
         export_url = (
             f"/api/v1/runs/{run['RUN_ID']}/details/{d['DETAIL_ID']}/export-csv"
-            if failed_cnt > 0
+            if failed_cnt > 0 and d["RULE_ID"] != "step0_schema_contract"
             else None
         )
         rule_results.append(
@@ -60,12 +102,17 @@ def _build_run_response(run: Dict[str, Any], details: List[Dict[str, Any]]) -> R
                 risk_priority=d["RISK_PRIORITY"],
                 rule_run_status=d["RULE_RUN_STATUS"],
                 failed_row_count=failed_cnt,
-                sample_failing_keys=_parse_sample_keys(d.get("SAMPLE_FAILING_KEYS")),
+                sample_failing_keys=_parse_json_list(d.get("SAMPLE_FAILING_KEYS")),
                 export_csv_url=export_url,
                 error_message=d.get("ERROR_MESSAGE"),
                 execution_ms=exec_ms,
             )
         )
+
+    coverage_pct = float(run.get("COVERAGE_PCT") if run.get("COVERAGE_PCT") is not None else 0.0)
+    confidence_score = float(
+        run.get("RELEASE_CONFIDENCE_SCORE") if run.get("RELEASE_CONFIDENCE_SCORE") is not None else 100.0
+    )
 
     return RunGateResponse(
         run_id=run["RUN_ID"],
@@ -78,12 +125,20 @@ def _build_run_response(run: Dict[str, Any], details: List[Dict[str, Any]]) -> R
         allow_downstream=allow_downstream,
         planning_cycle_id=run.get("PLANNING_CYCLE_ID"),
         snapshot_ts=run.get("SNAPSHOT_TS"),
+        environment=run.get("ENVIRONMENT") or "PROD",
+        target_schema_override=run.get("TARGET_SCHEMA_OVERRIDE"),
+        coverage_pct=coverage_pct,
+        release_confidence_score=confidence_score,
+        schema_drift_status=run.get("SCHEMA_DRIFT_STATUS") or "PASS",
+        schema_drift_details=_parse_json_list(run.get("SCHEMA_DRIFT_DETAILS")),
         poll_url=f"/api/v1/runs/{run['RUN_ID']}",
         metrics=RunMetricsOut(
             total_rules_run=int(run.get("TOTAL_RULES_RUN") or len(details)),
             p1_failures=int(run.get("P1_FAILURES") or 0),
             p2_failures=int(run.get("P2_FAILURES") or 0),
             duration_ms=total_ms,
+            coverage_pct=coverage_pct,
+            release_confidence_score=confidence_score,
         ),
         ai_triage_summary=run.get("AI_TRIAGE_SUMMARY"),
         override_by=run.get("OVERRIDE_BY"),
@@ -110,10 +165,18 @@ async def _execute_gate_run(
     team: Dict[str, Any],
     domain: Dict[str, Any],
     approved_rules: List[Dict[str, Any]],
-    planning_cycle_id: str | None,
-    snapshot_ts: str | None,
-    cortex_model: str | None = None,
+    planning_cycle_id: Optional[str],
+    snapshot_ts: Optional[str],
+    cortex_model: Optional[str] = None,
+    target_schema_override: Optional[str] = None,
 ) -> None:
+    # Step-0 Schema Contract Drift Check (before running SQL rules)
+    drift_res = sf_client.detect_schema_drift(
+        team, domain, target_schema_override=target_schema_override
+    )
+    schema_drift_status = drift_res.get("status", "PASS")
+    schema_drift_details = drift_res.get("drifts", [])
+
     semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_QUERIES)
 
     async def _run_single(rule: Dict[str, Any]) -> Dict[str, Any]:
@@ -129,6 +192,7 @@ async def _execute_gate_run(
                         planning_cycle_id=planning_cycle_id,
                         snapshot_ts=snapshot_ts,
                         capture_transient_detail_id=detail_id,
+                        target_schema_override=target_schema_override,
                     ),
                     timeout=float(settings.STATEMENT_TIMEOUT_IN_SECONDS),
                 )
@@ -171,7 +235,24 @@ async def _execute_gate_run(
                     "execution_ms": int((time.perf_counter() - t0) * 1000),
                 }
 
-    details = await asyncio.gather(*[_run_single(r) for r in approved_rules])
+    details = list(await asyncio.gather(*[_run_single(r) for r in approved_rules]))
+
+    if schema_drift_status == "DRIFT_DETECTED":
+        details.insert(
+            0,
+            {
+                "detail_id": f"det_{uuid.uuid4().hex[:8]}",
+                "rule_id": "step0_schema_contract",
+                "risk_name": "Step-0 Schema Contract Drift (SCHEMA_CONTRACT_DRIFT)",
+                "risk_priority": "P1_BLOCKER",
+                "rule_run_status": "FAIL",
+                "failed_row_count": len(schema_drift_details),
+                "sample_failing_keys": schema_drift_details[:5],
+                "failure_table_ref": None,
+                "error_message": "; ".join(d.get("detail", "") for d in schema_drift_details[:3]),
+                "execution_ms": 1,
+            },
+        )
 
     p1_failures = sum(
         1
@@ -191,7 +272,15 @@ async def _execute_gate_run(
     else:
         gate_decision = "PASS"
 
-    ai_triage_summary: str | None = None
+    coverage_pct, release_confidence_score = compute_release_confidence_and_coverage(
+        domain=domain,
+        approved_rules=approved_rules,
+        schema_drift_status=schema_drift_status,
+        p1_failures=p1_failures,
+        p2_failures=p2_failures,
+    )
+
+    ai_triage_summary: Optional[str] = None
     if gate_decision in ("BLOCKED_DOWNSTREAM", "PASS_WITH_WARNINGS"):
         failed_names = [
             f"{d['risk_name']} ({d['failed_row_count']} rows)"
@@ -218,6 +307,10 @@ async def _execute_gate_run(
         p2_failures=p2_failures,
         ai_triage_summary=ai_triage_summary,
         details=details,
+        coverage_pct=coverage_pct,
+        release_confidence_score=release_confidence_score,
+        schema_drift_status=schema_drift_status,
+        schema_drift_details=schema_drift_details,
     )
 
     if gate_decision in ("BLOCKED_DOWNSTREAM", "PASS_WITH_WARNINGS") and team.get("ALERT_WEBHOOK_URL"):
@@ -251,6 +344,12 @@ async def run_preflight_gate(
     if not team or not domain or domain["TEAM_ID"] != payload.team_id:
         raise HTTPException(status_code=404, detail="Team or domain not found.")
 
+    if payload.target_schema_override and payload.target_schema_override.strip():
+        try:
+            sanitize_sql_identifier(payload.target_schema_override, "target_schema_override")
+        except SQLValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
     approved_rules = sf_client.list_rules(
         team_id=payload.team_id,
         domain_id=payload.domain_id,
@@ -263,6 +362,8 @@ async def run_preflight_gate(
         triggered_by=payload.triggered_by,
         planning_cycle_id=payload.planning_cycle_id,
         snapshot_ts=payload.snapshot_ts,
+        environment=payload.environment,
+        target_schema_override=payload.target_schema_override,
     )
 
     if payload.execution_mode == "ASYNC":
@@ -275,6 +376,7 @@ async def run_preflight_gate(
                 planning_cycle_id=payload.planning_cycle_id,
                 snapshot_ts=payload.snapshot_ts,
                 cortex_model=payload.cortex_model,
+                target_schema_override=payload.target_schema_override,
             )
         )
         _BACKGROUND_TASKS.add(task)
@@ -295,6 +397,7 @@ async def run_preflight_gate(
                 planning_cycle_id=payload.planning_cycle_id,
                 snapshot_ts=payload.snapshot_ts,
                 cortex_model=payload.cortex_model,
+                target_schema_override=payload.target_schema_override,
             ),
             timeout=float(settings.SYNC_HTTP_TIMEOUT_SECONDS),
         )

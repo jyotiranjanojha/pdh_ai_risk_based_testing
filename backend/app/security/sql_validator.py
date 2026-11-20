@@ -38,6 +38,73 @@ def _validate_identifier(identifier: str, label: str) -> str:
     return cleaned
 
 
+def sanitize_sql_identifier(identifier: str, label: str = "identifier") -> str:
+    """Validate and return a safe 1-to-3 part Snowflake SQL identifier."""
+    return _validate_identifier(identifier, label)
+
+
+def extract_sql_lineage_summary(sql_or_diff: str) -> Dict[str, Any]:
+    """
+    Parse transformation SQL or a PR SQL diff with sqlglot to extract
+    referenced tables, joins, filters, aggregations, and CASE WHEN branches.
+    """
+    if not sql_or_diff or not sql_or_diff.strip():
+        return {"tables": [], "joins": [], "filters": [], "aggregations": [], "case_branches": 0}
+
+    # Strip git unified-diff markers (+ / - / @@) if a PR diff was supplied
+    cleaned_lines: List[str] = []
+    for line in sql_or_diff.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(("+++", "---", "@@", "diff --git", "index ")):
+            continue
+        if stripped.startswith("+") or stripped.startswith("-"):
+            cleaned_lines.append(stripped[1:])
+        else:
+            cleaned_lines.append(line)
+    cleaned_sql = "\n".join(cleaned_lines).strip()
+
+    tables: set[str] = set()
+    joins: List[str] = []
+    filters: List[str] = []
+    aggregations: set[str] = set()
+    case_branches = 0
+
+    try:
+        parsed_stmts = sqlglot.parse(cleaned_sql, read="snowflake")
+    except Exception:
+        return {
+            "tables": [],
+            "joins": [],
+            "filters": [],
+            "aggregations": [],
+            "case_branches": 0,
+            "raw_snippet": cleaned_sql[:1200],
+        }
+
+    for stmt in parsed_stmts:
+        if stmt is None:
+            continue
+        for tbl in stmt.find_all(exp.Table):
+            if tbl.name:
+                fq = ".".join(p for p in (tbl.catalog, tbl.db, tbl.name) if p)
+                tables.add(fq)
+        for j in stmt.find_all(exp.Join):
+            joins.append(j.sql(dialect="snowflake")[:200])
+        for w in stmt.find_all(exp.Where):
+            filters.append(w.sql(dialect="snowflake")[:200])
+        for agg in stmt.find_all(exp.AggFunc):
+            aggregations.add(agg.sql_name().upper() if hasattr(agg, "sql_name") else type(agg).__name__.upper())
+        case_branches += len(list(stmt.find_all(exp.Case)))
+
+    return {
+        "tables": sorted(tables),
+        "joins": joins[:10],
+        "filters": filters[:10],
+        "aggregations": sorted(aggregations),
+        "case_branches": case_branches,
+    }
+
+
 def _check_recursive_depth_guardrail(ast: exp.Expression, max_hierarchy_depth: int) -> None:
     """Ensure any WITH RECURSIVE CTE enforces a depth <= max_hierarchy_depth bound."""
     with_clause = ast.args.get("with")
@@ -119,10 +186,11 @@ def wrap_with_target_dataset_cte(
     planning_cycle_id: Optional[str] = None,
     snapshot_ts: Optional[str] = None,
     max_hierarchy_depth: Optional[int] = None,
+    baseline_fqn: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
-    Validate SQL and dynamically wrap `__TARGET_DATASET__` as a filtered CTE
-    using parameterized bind variables for planning_cycle_id and snapshot_ts.
+    Validate SQL and dynamically wrap `__TARGET_DATASET__` (and optional `__BASELINE_DATASET__`)
+    as filtered CTEs using parameterized bind variables for planning_cycle_id and snapshot_ts.
     """
     validate_readonly_sql(sql, max_hierarchy_depth=max_hierarchy_depth)
     safe_target = _validate_identifier(target_fqn, "target_fqn")
@@ -150,20 +218,33 @@ def wrap_with_target_dataset_cte(
         bind_params.setdefault("snapshot_ts", snapshot_ts)
 
     where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-    target_cte_body = f"__TARGET_DATASET__ AS (\n    SELECT * FROM {safe_target}{where_sql}\n)"
+    cte_parts: List[str] = [
+        f"__TARGET_DATASET__ AS (\n    SELECT * FROM {safe_target}{where_sql}\n)"
+    ]
 
-    # Only inject __TARGET_DATASET__ CTE if referenced in SQL or temporal filters are active
-    needs_cte = "__TARGET_DATASET__" in normalized_sql.upper() or bool(where_clauses)
+    upper_sql = normalized_sql.upper()
+    needs_baseline = "__BASELINE_DATASET__" in upper_sql
+    if needs_baseline:
+        effective_baseline = baseline_fqn or safe_target
+        safe_baseline = _validate_identifier(effective_baseline, "baseline_fqn")
+        cte_parts.append(
+            f"__BASELINE_DATASET__ AS (\n    SELECT * FROM {safe_baseline}{where_sql}\n)"
+        )
+
+    # Only inject CTEs if referenced in SQL or temporal filters are active
+    needs_cte = "__TARGET_DATASET__" in upper_sql or needs_baseline or bool(where_clauses)
     if not needs_cte:
         return normalized_sql, bind_params
 
-    # If SQL already begins with WITH [RECURSIVE], prepend __TARGET_DATASET__ into existing WITH
+    cte_block = ",\n".join(cte_parts)
+
+    # If SQL already begins with WITH [RECURSIVE], prepend CTEs into existing WITH
     with_match = re.match(r"^\s*WITH\s+(RECURSIVE\s+)?", normalized_sql, flags=re.IGNORECASE)
     if with_match:
         recursive_kw = with_match.group(1) or ""
         rest = normalized_sql[with_match.end():]
-        wrapped_sql = f"WITH {recursive_kw}{target_cte_body},\n{rest}"
+        wrapped_sql = f"WITH {recursive_kw}{cte_block},\n{rest}"
     else:
-        wrapped_sql = f"WITH {target_cte_body}\n{normalized_sql}"
+        wrapped_sql = f"WITH {cte_block}\n{normalized_sql}"
 
     return wrapped_sql, bind_params

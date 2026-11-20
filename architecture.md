@@ -1,4 +1,4 @@
-# 🏗️ System Architecture — Enterprise AI RBT Platform
+# 🏗️ System Architecture — Enterprise AI RBT Platform (v2.1)
 
 > **Zero-Data-Egress Control Plane** for AI-assisted Risk-Based Testing on **Snowflake** + **Snowflake Cortex AI**.  
 > Back to [README.md](./README.md) · Live UI: [http://localhost:3000](http://localhost:3000) · API Docs: [http://localhost:8000/docs](http://localhost:8000/docs)
@@ -51,10 +51,10 @@ flowchart TD
 | **Styling & Icons** | **Tailwind CSS**, **Lucide React** | Full-width responsive layout, Light/Dark mode | [AppShell.tsx](./frontend/src/components/AppShell.tsx) |
 | **SQL Studio** | **CodeMirror 6** (`@uiw/react-codemirror`, `@codemirror/lang-sql`) | Interactive SQL rule editing & syntax highlighting | [SqlEditor.tsx](./frontend/src/components/SqlEditor.tsx) |
 | **Backend API** | **FastAPI**, **Pydantic v2**, **Uvicorn** | REST APIs, OpenAPI Swagger docs, async gate execution | [backend/app/main.py](./backend/app/main.py), [models.py](./backend/app/schemas/models.py) |
-| **SQL Security** | **sqlglot** AST Parser | Blocks DML/DDL, enforces single-statement `SELECT`, bounds recursion | [sql_validator.py](./backend/app/security/sql_validator.py) |
+| **SQL Security** | **sqlglot** AST Parser | Blocks DML/DDL, enforces single-statement `SELECT`, bounds recursion, extracts transformation/PR-diff lineage, sanitizes `target_schema_override` & binds `__TARGET_DATASET__` / `__BASELINE_DATASET__` | [sql_validator.py](./backend/app/security/sql_validator.py) |
 | **Snowflake Connector** | **snowflake-connector-python** | Live SSO (`externalbrowser`), key-pair auth, Cortex & query execution | [snowflake_client.py](./backend/app/db/snowflake_client.py) |
 | **Local Mock Engine** | **SQLite** (in-memory/local) | Zero-dependency local testing when `SNOWFLAKE_MOCK_MODE=true` | [snowflake_client.py](./backend/app/db/snowflake_client.py) |
-| **Testing** | **pytest**, **httpx**, **TypeScript (`tsc`)** | 28 automated API/RBAC/AST tests + strict typechecking | [backend/tests](./backend/tests) |
+| **Testing** | **pytest**, **httpx**, **TypeScript (`tsc`)** | 38 automated API/RBAC/AST/v2.1 tests + strict typechecking | [backend/tests](./backend/tests) |
 
 ---
 
@@ -94,23 +94,27 @@ Enforced by [dependencies.py](./backend/app/auth/dependencies.py):
 
 | Role | Level | Permissions |
 | :--- | :---: | :--- |
-| **`AUTHOR`** | 1 | View teams/schemas/rules, onboard datasets, run AI discovery, edit & dry-run SQL rules |
-| **`APPROVER`** | 2 | Everything in `AUTHOR` + approve/archive rules, execute **Break-Glass Override** on failed gates |
-| **`ADMIN`** | 3 | Everything in `APPROVER` + create/update teams, manage team members, rotate `X-API-Key` |
+| **`AUTHOR`** | 1 | View teams/schemas/rules/members, onboard datasets (with optional upstream source & transformation SQL), run AI/PR-diff discovery, edit & dry-run SQL rules (`DEV`/`UAT`/`PROD`), trigger gates |
+| **`APPROVER`** | 2 | Inherits all `AUTHOR` privileges + approve/archive rules, share templates, **Re-Baseline Schema** (`POST /api/v1/domains/{id}/rebaseline`), execute **Break-Glass Override** on failed gates (cannot create workspaces or map user roles) |
+| **`ADMIN`** | 3 | Full privilege: inherits all `APPROVER` + `AUTHOR` privileges + create/update team workspaces (`+ New Team`), map/update/remove user roles (`POST`/`DELETE /api/v1/teams/{id}/members`), rotate `X-API-Key` |
 
-### Rule Lifecycle
+### Quantitative Risk Scoring & Rule Lifecycle
 ```
 AI Generated / Manual Draft ──▶ [ DRAFT ] ──(APPROVER)──▶ [ APPROVED ] ──▶ [ ARCHIVED ]
                                     │                           ▲
                               (Edit SQL)                        │
                                     └──▶ New Version Saved ─────┘
 ```
-- **Versioning:** Every edit to a rule's SQL inserts an immutable snapshot into `RBT_TEST_RULE_HISTORY` and increments `VERSION_NUMBER`.
+- **Quantitative Risk Matrix (`Likelihood × Impact`):** Each rule carries `LIKELIHOOD_SCORE` (1–5) and `IMPACT_SCORE` (1–5), computing `RISK_SCORE` (1–25). Unless manually overridden, `RISK_SCORE` auto-maps to priority: `16–25 → P1_BLOCKER`, `8–15 → P2_WARNING`, `1–7 → P3_INFO`.
+- **Versioning:** Every edit to a rule's SQL inserts an immutable snapshot into `RBT_TEST_RULE_HISTORY` and increments `VERSION_NUM`.
 - **Execution Semantics:** Every rule SQL query is written so **`0 rows returned = PASS`** and **`>= 1 row returned = FAIL`**.
-- **Gate Decision:**
-  - Any `APPROVED` **P1 (Critical)** failure → `FAIL` (`allow_downstream = false`, `HTTP 422` in `SYNC` mode).
-  - Only **P2/P3** failures → `PASS_WITH_WARNINGS` (`allow_downstream = true`).
+- **Step-0 Schema Contract Gate:** Before running SQL rules, `run-gate` compares live `INFORMATION_SCHEMA.COLUMNS` against `BASELINE_SCHEMA_JSON`. Dropped columns or precision/scale narrowing (e.g., `NUMBER(18,4)` → `NUMBER(18,0)`) trigger an automatic `P1_BLOCKER` (`SCHEMA_CONTRACT_DRIFT`).
+- **Multi-Environment Routing & Regression Diffs:** `run-gate` and `dry-run` accept `environment` (`DEV` | `UAT` | `PROD`) and `target_schema_override` (sanitized via `sqlglot`), routing `__TARGET_DATASET__` to the candidate schema while keeping `__BASELINE_DATASET__` bound to canonical `PROD` for `REGRESSION_DIFF` checks.
+- **Gate Decision & Release Confidence Scorecard:**
+  - Any `APPROVED` **P1 (`P1_BLOCKER`)** or **Step-0 Schema Drift** failure → `BLOCKED_DOWNSTREAM` (`allow_downstream = false`, `HTTP 422` in `SYNC` mode).
+  - Only **P2 (`P2_WARNING`)** failures → `PASS_WITH_WARNINGS` (`allow_downstream = true`).
   - Manual `APPROVER` override → `OVERRIDDEN_PASS`.
+  - Every run computes `COVERAGE_PCT` (critical column test coverage %) and `RELEASE_CONFIDENCE_SCORE` (`0–100`).
 
 ---
 
@@ -125,33 +129,35 @@ sequenceDiagram
     participant Guard as sqlglot Guard
     participant SF as Snowflake + Cortex AI
 
-    Note over User,SF: Phase 1 — SSO & AI Dataset Onboarding
+    Note over User,SF: Phase 1 — SSO & AI Dataset Onboarding (v2.1 Grounded)
     User->>UI: Click "Snowflake SSO"
     UI->>API: POST /api/v1/auth/sso-start
     API->>SF: Open externalbrowser SSO & cache connection
-    User->>UI: Open /onboard, pick Schema & Table
+    User->>UI: Open /onboard, pick Schema/Table (+ optional Upstream & Transform SQL/PR Diff)
     UI->>API: POST /api/v1/domains/{id}/ai-discover
-    API->>SF: Query INFORMATION_SCHEMA.COLUMNS, PK/FK, COUNT/MIN/MAX
-    API->>SF: SNOWFLAKE.CORTEX.COMPLETE(model, grounding + schema)
-    SF-->>API: Structured JSON (5-8 SQL rules)
+    API->>SF: Query INFORMATION_SCHEMA.COLUMNS, PK/FK, COUNT/MIN/MAX & snapshot BASELINE_SCHEMA_JSON
+    API->>Guard: Parse Transformation SQL / PR Diff lineage (tables, joins, filters, CASE)
+    API->>SF: SNOWFLAKE.CORTEX.COMPLETE(model, grounding + lineage + schema)
+    SF-->>API: Structured JSON (rules + likelihood_score & impact_score)
     API->>Guard: Validate AST (read-only SELECT, recursion depth)
     API->>SF: Compile-check SQL & save rules to RBT_TEST_RULES
 
-    Note over User,SF: Phase 2 — Quality Gate Execution
-    User->>UI: Trigger Gate Run (or Airflow via X-API-Key)
+    Note over User,SF: Phase 2 — Step-0 Schema Contract & Quality Gate Execution
+    User->>UI: Trigger Gate Run (PROD/UAT/DEV + optional target_schema_override)
     UI->>API: POST /api/v1/execution/run-gate
-    API->>Guard: Wrap __TARGET_DATASET__ CTE + cycle/snapshot filters
+    API->>SF: Step-0 Compare live schema vs BASELINE_SCHEMA_JSON
+    API->>Guard: Wrap __TARGET_DATASET__ (override) & __BASELINE_DATASET__ (PROD) CTEs
     API->>SF: Execute APPROVED rules on team warehouse
     SF-->>API: Failed row counts + up to 5 sample keys
-    API->>SF: Persist RBT_EXECUTION_RUNS & RBT_EXECUTION_DETAILS
-    API-->>UI: Gate Decision (PASS / FAIL) + AI Triage Summary
+    API->>SF: Compute Coverage % & Release Confidence Score; persist RBT_EXECUTION_RUNS
+    API-->>UI: Gate Decision (PASS / BLOCKED_DOWNSTREAM) + Scorecard + AI Triage Summary
 ```
 
 ---
 
 ## 🗄️ 6. Metadata Data Model (ER Diagram)
 
-All 7 metadata tables are defined in [01_init_ddl.sql](./backend/app/db/migrations/01_init_ddl.sql) and hosted in `IF_SUPPLY_CHAIN.PDH_SUPPLY_PLANNING_SRC_BASE`:
+All 7 metadata tables are defined in [01_init_ddl.sql](./backend/app/db/migrations/01_init_ddl.sql) (with additive v2.1 columns in [02_rbt_v21_upgrade.sql](./backend/app/db/migrations/02_rbt_v21_upgrade.sql)) and hosted in `IF_SUPPLY_CHAIN.PDH_SUPPLY_PLANNING_SRC_BASE`:
 
 ```mermaid
 erDiagram
@@ -178,15 +184,21 @@ erDiagram
         string TARGET_SCHEMA
         string TARGET_TABLE
         string CRITICALITY
+        variant BASELINE_SCHEMA_JSON
+        string UPSTREAM_SOURCE_TABLE
+        string TRANSFORMATION_SQL
     }
     RBT_TEST_RULES {
         string RULE_ID PK
         string TEAM_ID FK
         string DOMAIN_ID FK
         string RISK_NAME
+        string RISK_CATEGORY
         string RISK_PRIORITY
+        int LIKELIHOOD_SCORE
+        int IMPACT_SCORE
+        int RISK_SCORE
         string STATUS
-        int VERSION_NUMBER
     }
     RBT_EXECUTION_RUNS {
         string RUN_ID PK
@@ -194,5 +206,10 @@ erDiagram
         string DOMAIN_ID FK
         string EXECUTION_STATUS
         string GATE_DECISION
+        string ENVIRONMENT
+        string TARGET_SCHEMA_OVERRIDE
+        float COVERAGE_PCT
+        float RELEASE_CONFIDENCE_SCORE
+        string SCHEMA_DRIFT_STATUS
     }
 ```

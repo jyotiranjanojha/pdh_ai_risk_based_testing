@@ -16,9 +16,25 @@ RiskCategory = Literal[
     "DUPLICATE_KEY",
     "FRESHNESS_ANOMALY",
     "FROZEN_HORIZON_VIOLATION",
+    "SCHEMA_CONTRACT_DRIFT",
+    "PIPELINE_RECONCILIATION",
+    "REGRESSION_DIFF",
 ]
 
 RiskPriority = Literal["P1_BLOCKER", "P2_WARNING", "P3_INFO"]
+
+EnvironmentType = Literal["DEV", "UAT", "PROD"]
+
+SchemaDriftStatus = Literal["PASS", "DRIFT_DETECTED", "SKIPPED"]
+
+
+def map_risk_score_to_priority(risk_score: int) -> RiskPriority:
+    """Auto-map Likelihood * Impact score (1-25) to RBT priority."""
+    if risk_score >= 16:
+        return "P1_BLOCKER"
+    if risk_score >= 8:
+        return "P2_WARNING"
+    return "P3_INFO"
 
 RuleStatus = Literal["DRAFT", "DRAFT_NEEDS_REVIEW", "APPROVED", "ARCHIVED"]
 
@@ -61,12 +77,17 @@ CORTEX_RULE_LIST_SCHEMA: Dict[str, Any] = {
                             "DUPLICATE_KEY",
                             "FRESHNESS_ANOMALY",
                             "FROZEN_HORIZON_VIOLATION",
+                            "SCHEMA_CONTRACT_DRIFT",
+                            "PIPELINE_RECONCILIATION",
+                            "REGRESSION_DIFF",
                         ],
                     },
                     "risk_priority": {
                         "type": "string",
                         "enum": ["P1_BLOCKER", "P2_WARNING", "P3_INFO"],
                     },
+                    "likelihood_score": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "impact_score": {"type": "integer", "minimum": 1, "maximum": 5},
                     "business_impact_desc": {"type": "string"},
                     "validation_sql": {"type": "string"},
                 },
@@ -74,6 +95,8 @@ CORTEX_RULE_LIST_SCHEMA: Dict[str, Any] = {
                     "risk_name",
                     "risk_category",
                     "risk_priority",
+                    "likelihood_score",
+                    "impact_score",
                     "business_impact_desc",
                     "validation_sql",
                 ],
@@ -172,6 +195,8 @@ class DomainCreate(BaseModel):
     downstream_consumer: Optional[str] = None
     business_context: Optional[str] = None
     criticality: DomainCriticality = "HIGH"
+    upstream_source_table: Optional[str] = None
+    transformation_sql: Optional[str] = None
 
 
 class DomainOut(BaseModel):
@@ -187,8 +212,17 @@ class DomainOut(BaseModel):
     downstream_consumer: Optional[str] = None
     business_context: Optional[str] = None
     criticality: DomainCriticality = "HIGH"
+    baseline_schema_json: Optional[List[Dict[str, Any]]] = None
+    upstream_source_table: Optional[str] = None
+    transformation_sql: Optional[str] = None
     is_active: bool = True
     created_ts: datetime
+
+
+class RebaselineResponse(BaseModel):
+    domain_id: str
+    column_count: int
+    baseline_schema_json: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class GroundingColumnInfo(BaseModel):
@@ -197,6 +231,8 @@ class GroundingColumnInfo(BaseModel):
     data_type: str
     is_nullable: bool
     comment: Optional[str] = None
+    numeric_precision: Optional[int] = None
+    numeric_scale: Optional[int] = None
 
 
 class GroundingConstraintInfo(BaseModel):
@@ -227,6 +263,8 @@ class GeneratedRuleDraft(BaseModel):
     risk_name: str
     risk_category: RiskCategory
     risk_priority: RiskPriority
+    likelihood_score: int = Field(default=3, ge=1, le=5)
+    impact_score: int = Field(default=3, ge=1, le=5)
     business_impact_desc: str
     validation_sql: str
 
@@ -239,6 +277,9 @@ class RuleOut(BaseModel):
     risk_name: str
     risk_category: Optional[RiskCategory] = None
     risk_priority: RiskPriority
+    likelihood_score: int = Field(default=3, ge=1, le=5)
+    impact_score: int = Field(default=3, ge=1, le=5)
+    risk_score: int = Field(default=9, ge=1, le=25)
     business_impact_desc: Optional[str] = None
     validation_sql: str
     status: RuleStatus = "DRAFT"
@@ -253,6 +294,8 @@ class RuleUpdate(BaseModel):
     risk_name: Optional[str] = None
     risk_category: Optional[RiskCategory] = None
     risk_priority: Optional[RiskPriority] = None
+    likelihood_score: Optional[int] = Field(default=None, ge=1, le=5)
+    impact_score: Optional[int] = Field(default=None, ge=1, le=5)
     business_impact_desc: Optional[str] = None
     validation_sql: Optional[str] = None
     status: Optional[RuleStatus] = None
@@ -275,6 +318,8 @@ class RuleDryRunRequest(BaseModel):
     validation_sql: Optional[str] = None
     planning_cycle_id: Optional[str] = None
     snapshot_ts: Optional[str] = None
+    environment: EnvironmentType = "PROD"
+    target_schema_override: Optional[str] = None
 
 
 class RuleDryRunResponse(BaseModel):
@@ -290,6 +335,7 @@ class RuleDryRunResponse(BaseModel):
 
 class AiDiscoverRequest(BaseModel):
     cortex_model: Optional[str] = None
+    pr_sql_diff: Optional[str] = None
 
 
 class AiDiscoverResponse(BaseModel):
@@ -310,6 +356,9 @@ class MarketplaceTemplateOut(BaseModel):
     risk_name: str
     risk_category: Optional[RiskCategory] = None
     risk_priority: RiskPriority
+    likelihood_score: int = 3
+    impact_score: int = 3
+    risk_score: int = 9
     business_impact_desc: Optional[str] = None
     validation_sql: str
     approved_by: Optional[str] = None
@@ -339,6 +388,8 @@ class RunGateRequest(BaseModel):
     planning_cycle_id: Optional[str] = None
     snapshot_ts: Optional[str] = None
     cortex_model: Optional[str] = None
+    environment: EnvironmentType = "PROD"
+    target_schema_override: Optional[str] = None
 
 
 class RunMetricsOut(BaseModel):
@@ -346,6 +397,8 @@ class RunMetricsOut(BaseModel):
     p1_failures: int
     p2_failures: int
     duration_ms: int
+    coverage_pct: float = 0.0
+    release_confidence_score: float = 100.0
 
 
 class RuleResultOut(BaseModel):
@@ -372,6 +425,12 @@ class RunGateResponse(BaseModel):
     allow_downstream: bool
     planning_cycle_id: Optional[str] = None
     snapshot_ts: Optional[str] = None
+    environment: EnvironmentType = "PROD"
+    target_schema_override: Optional[str] = None
+    coverage_pct: float = 0.0
+    release_confidence_score: float = 100.0
+    schema_drift_status: SchemaDriftStatus = "PASS"
+    schema_drift_details: List[Dict[str, Any]] = Field(default_factory=list)
     poll_url: str
     metrics: RunMetricsOut
     ai_triage_summary: Optional[str] = None

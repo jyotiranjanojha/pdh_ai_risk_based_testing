@@ -24,6 +24,10 @@ export default function OnboardPage() {
   const [businessContext, setBusinessContext] = useState(
     "Supply planning dataset quality and integrity checks."
   );
+  const [upstreamSourceTable, setUpstreamSourceTable] = useState("");
+  const [showTransformSql, setShowTransformSql] = useState(false);
+  const [transformationSql, setTransformationSql] = useState("");
+  const [prSqlDiff, setPrSqlDiff] = useState("");
 
   const [step, setStep] = useState<number>(0); // 0=idle, 1=registering, 2=grounding, 3=cortex, 4=done
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -73,10 +77,17 @@ export default function OnboardPage() {
         downstream_consumer: downstreamConsumer || undefined,
         business_context: businessContext || undefined,
         criticality,
+        upstream_source_table: upstreamSourceTable.trim() || undefined,
+        transformation_sql: transformationSql.trim() || undefined,
       });
 
       setStep(2);
-      const discovery = await rbtApi.aiDiscover(authHeaders, domain.domain_id, cortexModel);
+      const discovery = await rbtApi.aiDiscover(
+        authHeaders,
+        domain.domain_id,
+        cortexModel,
+        prSqlDiff.trim() || undefined
+      );
       setStep(4);
       setResult(discovery);
     } catch (err) {
@@ -210,6 +221,56 @@ export default function OnboardPage() {
                 className="w-full rounded-lg border border-slate-300 bg-transparent px-3 py-2 font-mono text-xs dark:border-slate-700"
               />
             </div>
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500">
+              Upstream Source / Staging Table (Optional — for Cross-Hop Reconciliation)
+            </label>
+            <input
+              value={upstreamSourceTable}
+              onChange={(e) => setUpstreamSourceTable(e.target.value)}
+              placeholder="e.g., SUPPLY_CHAIN.INTERSITE_BOM_STAGING"
+              className="w-full rounded-lg border border-slate-300 bg-transparent px-3 py-2 font-mono text-xs dark:border-slate-700"
+            />
+          </div>
+
+          <div>
+            <button
+              type="button"
+              onClick={() => setShowTransformSql((v) => !v)}
+              className="text-xs font-semibold text-blue-500 hover:underline"
+            >
+              {showTransformSql ? "▼ Hide" : "▶"} Pipeline Transformation SQL / Git PR Diff (Optional)
+            </button>
+            {showTransformSql && (
+              <div className="mt-2 space-y-3 rounded-lg border border-slate-200 p-3 dark:border-slate-800">
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-slate-500">
+                    Pipeline Transformation SQL
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={transformationSql}
+                    onChange={(e) => setTransformationSql(e.target.value)}
+                    placeholder="SELECT ... FROM ... JOIN ... WHERE ..."
+                    className="w-full rounded-lg border border-slate-300 bg-transparent px-3 py-2 font-mono text-xs dark:border-slate-700"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-slate-500">
+                    Git PR SQL Diff (Optional)
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={prSqlDiff}
+                    onChange={(e) => setPrSqlDiff(e.target.value)}
+                    placeholder="+ WHERE BOM_QTY > 0&#10;- LEFT JOIN ..."
+                    className="w-full rounded-lg border border-slate-300 bg-transparent px-3 py-2 font-mono text-xs dark:border-slate-700"
+                  />
+                </div>
+              </div>
+            )}
           </div>
 
           <div>

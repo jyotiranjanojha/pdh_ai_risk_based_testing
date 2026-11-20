@@ -6,9 +6,14 @@ export type RiskCategory =
   | "BOUNDARY_VALUE"
   | "DUPLICATE_KEY"
   | "FRESHNESS_ANOMALY"
-  | "FROZEN_HORIZON_VIOLATION";
+  | "FROZEN_HORIZON_VIOLATION"
+  | "SCHEMA_CONTRACT_DRIFT"
+  | "PIPELINE_RECONCILIATION"
+  | "REGRESSION_DIFF";
 
 export type RiskPriority = "P1_BLOCKER" | "P2_WARNING" | "P3_INFO";
+export type EnvironmentType = "DEV" | "UAT" | "PROD";
+export type SchemaDriftStatus = "PASS" | "DRIFT_DETECTED" | "SKIPPED";
 export type RuleStatus = "DRAFT" | "DRAFT_NEEDS_REVIEW" | "APPROVED" | "ARCHIVED";
 export type GateDecision =
   | "PENDING"
@@ -28,6 +33,14 @@ export interface Team {
   created_ts: string;
 }
 
+export interface TeamMember {
+  member_id: string;
+  team_id: string;
+  user_email: string;
+  user_role: UserRole;
+  created_ts: string;
+}
+
 export interface Domain {
   domain_id: string;
   team_id: string;
@@ -41,6 +54,9 @@ export interface Domain {
   downstream_consumer?: string | null;
   business_context?: string | null;
   criticality: "CRITICAL" | "HIGH" | "MEDIUM";
+  baseline_schema_json?: Record<string, unknown>[] | null;
+  upstream_source_table?: string | null;
+  transformation_sql?: string | null;
   is_active: boolean;
   created_ts: string;
 }
@@ -53,6 +69,9 @@ export interface Rule {
   risk_name: string;
   risk_category?: RiskCategory | null;
   risk_priority: RiskPriority;
+  likelihood_score: number;
+  impact_score: number;
+  risk_score: number;
   business_impact_desc?: string | null;
   validation_sql: string;
   status: RuleStatus;
@@ -124,6 +143,9 @@ export interface MarketplaceTemplate {
   risk_name: string;
   risk_category?: RiskCategory | null;
   risk_priority: RiskPriority;
+  likelihood_score: number;
+  impact_score: number;
+  risk_score: number;
   business_impact_desc?: string | null;
   validation_sql: string;
   approved_by?: string | null;
@@ -153,12 +175,20 @@ export interface ExecutionRun {
   allow_downstream: boolean;
   planning_cycle_id?: string | null;
   snapshot_ts?: string | null;
+  environment?: EnvironmentType;
+  target_schema_override?: string | null;
+  coverage_pct?: number;
+  release_confidence_score?: number;
+  schema_drift_status?: SchemaDriftStatus;
+  schema_drift_details?: Record<string, unknown>[];
   poll_url: string;
   metrics: {
     total_rules_run: number;
     p1_failures: number;
     p2_failures: number;
     duration_ms: number;
+    coverage_pct?: number;
+    release_confidence_score?: number;
   };
   ai_triage_summary?: string | null;
   override_by?: string | null;
@@ -206,6 +236,10 @@ async function apiFetch<T>(
       detail = await res.text();
     }
     throw new Error(detail);
+  }
+
+  if (res.status === 204) {
+    return undefined as T;
   }
 
   return (await res.json()) as T;
@@ -275,6 +309,24 @@ export const rbtApi = {
       { method: "POST" }
     ),
 
+  listTeamMembers: (auth: AuthContextHeaders, teamId: string) =>
+    apiFetch<TeamMember[]>(`/api/v1/teams/${teamId}/members`, auth),
+
+  upsertTeamMember: (
+    auth: AuthContextHeaders,
+    teamId: string,
+    payload: { user_email: string; user_role: UserRole }
+  ) =>
+    apiFetch<TeamMember>(`/api/v1/teams/${teamId}/members`, auth, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  removeTeamMember: (auth: AuthContextHeaders, teamId: string, memberId: string) =>
+    apiFetch<void>(`/api/v1/teams/${teamId}/members/${memberId}`, auth, {
+      method: "DELETE",
+    }),
+
   listSchemas: (auth: AuthContextHeaders, teamId: string) =>
     apiFetch<string[]>(`/api/v1/teams/${teamId}/schemas`, auth),
 
@@ -295,6 +347,8 @@ export const rbtApi = {
       downstream_consumer?: string;
       business_context?: string;
       criticality: "CRITICAL" | "HIGH" | "MEDIUM";
+      upstream_source_table?: string;
+      transformation_sql?: string;
     }
   ) =>
     apiFetch<Domain>(`/api/v1/teams/${teamId}/domains`, auth, {
@@ -302,10 +356,27 @@ export const rbtApi = {
       body: JSON.stringify(payload),
     }),
 
-  aiDiscover: (auth: AuthContextHeaders, domainId: string, cortexModel?: string) =>
+  rebaselineDomain: (auth: AuthContextHeaders, domainId: string) =>
+    apiFetch<{
+      domain_id: string;
+      column_count: number;
+      baseline_schema_json: Record<string, unknown>[];
+    }>(`/api/v1/domains/${domainId}/rebaseline`, auth, {
+      method: "POST",
+    }),
+
+  aiDiscover: (
+    auth: AuthContextHeaders,
+    domainId: string,
+    cortexModel?: string,
+    prSqlDiff?: string
+  ) =>
     apiFetch<AiDiscoverResponse>(`/api/v1/domains/${domainId}/ai-discover`, auth, {
       method: "POST",
-      body: JSON.stringify({ cortex_model: cortexModel }),
+      body: JSON.stringify({
+        cortex_model: cortexModel,
+        ...(prSqlDiff ? { pr_sql_diff: prSqlDiff } : {}),
+      }),
     }),
 
   listRules: (
@@ -330,6 +401,8 @@ export const rbtApi = {
       status: RuleStatus;
       is_shared_template: boolean;
       risk_priority: RiskPriority;
+      likelihood_score: number;
+      impact_score: number;
     }>
   ) =>
     apiFetch<Rule>(`/api/v1/rules/${ruleId}`, auth, {
@@ -343,7 +416,13 @@ export const rbtApi = {
   dryRunRule: (
     auth: AuthContextHeaders,
     ruleId: string,
-    payload: { validation_sql?: string; planning_cycle_id?: string; snapshot_ts?: string }
+    payload: {
+      validation_sql?: string;
+      planning_cycle_id?: string;
+      snapshot_ts?: string;
+      environment?: EnvironmentType;
+      target_schema_override?: string;
+    }
   ) =>
     apiFetch<DryRunResponse>(`/api/v1/rules/${ruleId}/dry-run`, auth, {
       method: "POST",
@@ -386,6 +465,8 @@ export const rbtApi = {
       planning_cycle_id?: string;
       snapshot_ts?: string;
       cortex_model?: string;
+      environment?: EnvironmentType;
+      target_schema_override?: string;
     }
   ) =>
     apiFetch<ExecutionRun>("/api/v1/execution/run-gate", auth, {

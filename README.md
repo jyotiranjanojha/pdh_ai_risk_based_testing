@@ -1,7 +1,7 @@
-# 🛡️ Enterprise AI Risk-Based Testing (RBT) Platform (PDH v2.0)
+# 🛡️ Enterprise AI Risk-Based Testing (RBT) Platform (PDH v2.1)
 
 > **Simple, zero-data-egress data quality testing powered by Snowflake & Cortex AI.**  
-> Inspect any Snowflake table, let AI write SQL quality checks for you, test rules in a built-in SQL studio, and block bad data before it reaches downstream supply-chain planners.
+> Inspect any Snowflake table, let AI write SQL quality checks for you, score risks quantitatively (`Likelihood × Impact`), enforce Step-0 Schema Contracts, test across `DEV` / `UAT` / `PROD`, and block bad data before it reaches downstream supply-chain planners.
 
 [![Architecture](https://img.shields.io/badge/Architecture-architecture.md-blue?style=flat-square)](./architecture.md)
 [![Live App](https://img.shields.io/badge/UI-http%3A%2F%2Flocalhost%3A3000-10b981?style=flat-square)](http://localhost:3000)
@@ -28,9 +28,11 @@
 Think of this platform as an **automated quality gatekeeper** for your Snowflake data:
 
 1. **🔒 Your Data Never Leaves Snowflake** — All table profiling, AI rule generation (`SNOWFLAKE.CORTEX.COMPLETE`), and SQL checks run directly inside Snowflake.
-2. **🤖 AI Writes Your Test Rules** — Pick a table, and Cortex AI (`claude-sonnet-4-5`, `llama3.3-70b`, `llama3.1-70b`, or `mistral-large2`) inspects the columns and writes SQL rules automatically.
-3. **🏢 Multi-Team Ready (6 Data Hubs)** — Supports **IP & IF Supply, Demand, and Material Planning Data Hubs**, each isolated with its own warehouse, rules, and API keys.
-4. **🚦 Safe by Design** — Every SQL rule is checked by an AST guardrail (`sqlglot`) to ensure only read-only `SELECT` queries run.
+2. **🤖 AI Writes Your Test Rules** — Pick a table (plus optional upstream staging table & transformation SQL / PR diff), and Cortex AI (`claude-sonnet-4-5`, `llama3.3-70b`, `llama3.1-70b`, or `mistral-large2`) inspects the columns and writes SQL rules automatically.
+3. **📊 Quantitative Risk & Release Confidence (v2.1)** — Every rule is scored on **Likelihood × Impact (1–25)**, and every gate run computes **Column Test Coverage %** and a **0–100% Release Confidence Score**.
+4. **🛡️ Step-0 Schema Contract & Multi-Env Routing (v2.1)** — Automatically blocks dropped columns or narrowed precision (`NUMBER(18,4)` → `NUMBER(18,0)`) before SQL rules run, and supports `DEV` / `UAT` / `PROD` `target_schema_override` + `REGRESSION_DIFF` (`__TARGET_DATASET__` vs. `__BASELINE_DATASET__`).
+5. **🏢 Multi-Team Ready & Strict RBAC (6 Data Hubs)** — Supports **IP & IF Supply, Demand, and Material Planning Data Hubs**, each isolated with its own warehouse, rules, API keys, and `ADMIN` > `APPROVER` > `AUTHOR` role hierarchy (only `ADMIN` can create team workspaces or map user roles).
+6. **🚦 Safe by Design** — Every SQL rule and schema override is checked by an AST guardrail (`sqlglot`) to ensure only read-only `SELECT` queries run.
 
 ---
 
@@ -46,21 +48,21 @@ Click **`Snowflake SSO`** in the top bar to sign in via Intel SSO in one click, 
 ---
 
 ### Step 2 — Onboard a Table & Generate AI Rules ([`/onboard`](http://localhost:3000/onboard))
-Select a **Target Schema** from your team's Snowflake database dropdown, enter a **Target Table / View**, and click **Onboard & Generate Rules**. Cortex AI reads `INFORMATION_SCHEMA` metadata and creates SQL rules for you.
+Select a **Target Schema** from your team's Snowflake database dropdown, enter a **Target Table / View**, and optionally provide an **Upstream Source Table** (for `PIPELINE_RECONCILIATION` checks) or **Pipeline Transformation SQL / Git PR Diff**. Cortex AI snapshots `BASELINE_SCHEMA_JSON`, parses SQL lineage via `sqlglot`, and generates scored SQL rules.
 
 ![AI Dataset Onboarding](frontend/public/screenshots/step2-onboard.png)
 
 ---
 
-### Step 3 — Review, Edit & Dry-Run Rules ([`/rules`](http://localhost:3000/rules))
-Browse all rules in **Risk Matrix & SQL Studio**, edit SQL in the built-in editor (every save creates a new version), and click **Dry Run** to test any rule live against Snowflake.
+### Step 3 — Review, Score, Edit & Dry-Run Rules ([`/rules`](http://localhost:3000/rules))
+Browse all rules in **Risk Matrix & SQL Studio**, adjust **Likelihood × Impact (1–5)** scores (with automatic `P1`/`P2`/`P3` priority mapping), re-discover risks against a **Git PR SQL Diff**, edit SQL in the built-in editor, and click **Dry Run** against `PROD`, `UAT`, or `DEV` (with optional `target_schema_override`).
 
 ![Risk Matrix & SQL Studio](frontend/public/screenshots/step3-rules.png)
 
 ---
 
 ### Step 4 — Run Quality Gates & Read AI Diagnosis ([`/runs`](http://localhost:3000/runs))
-Run all approved rules together as a batch gate. If any rows fail, inspect sample failing keys, download CSVs, and read the **AI Triage Summary** to understand the root cause.
+Run all approved rules together as a batch gate across `PROD`, `UAT`, or `DEV`. Inspect the **Step-0 Schema Contract** status (with **Re-Baseline** for `APPROVER+`), **Release Confidence & Coverage Scorecard**, sample failing keys, CSV downloads, and the **AI Triage Summary**.
 
 ![Gate Logs & Triage](frontend/public/screenshots/step4-runs.png)
 
@@ -114,7 +116,7 @@ Set `SNOWFLAKE_MOCK_MODE=false` in `backend/.env` with your Snowflake connection
 - **Auth:** `SNOWFLAKE_AUTHENTICATOR=externalbrowser` (one-click **Snowflake SSO** button in UI) or `SNOWFLAKE_PRIVATE_KEY_PATH` (PKCS#8)
 - **Default AI Model:** `CORTEX_MODEL=claude-sonnet-4-5`
 
-Initial DDL lives in [backend/app/db/migrations/01_init_ddl.sql](./backend/app/db/migrations/01_init_ddl.sql).
+Initial DDL lives in [backend/app/db/migrations/01_init_ddl.sql](./backend/app/db/migrations/01_init_ddl.sql), with additive v2.1 columns in [backend/app/db/migrations/02_rbt_v21_upgrade.sql](./backend/app/db/migrations/02_rbt_v21_upgrade.sql).
 
 </details>
 
@@ -124,7 +126,7 @@ Initial DDL lives in [backend/app/db/migrations/01_init_ddl.sql](./backend/app/d
 
 | Check | Command | What It Verifies |
 | :--- | :--- | :--- |
-| **Backend Tests** | `backend\.venv\Scripts\python.exe -m pytest backend\tests -q` | RBAC isolation, SQL AST guardrails, onboarding, Cortex parsing, versioning, gate execution, marketplace (`28 passed`) |
+| **Backend Tests** | `backend\.venv\Scripts\python.exe -m pytest backend\tests -q` | RBAC hierarchy (`ADMIN` > `APPROVER` > `AUTHOR`), SQL AST guardrails, onboarding, Cortex parsing, versioning, gate execution, marketplace, v2.1 scoring/drift/PR-diff/UAT overrides (`38 passed`) |
 | **TypeScript Check** | `cd frontend; npx tsc --noEmit` | Zero type errors across all pages & components |
 | **Production Build** | `cd frontend; npm run build` | Clean Next.js 14 build for all routes (`/`, `/onboard`, `/rules`, `/marketplace`, `/runs`, `/help`) |
 | **Interactive API Docs** | Open [http://localhost:8000/docs](http://localhost:8000/docs) | Test any REST endpoint directly via Swagger UI |
@@ -138,7 +140,7 @@ External orchestrators (Airflow, Control-M, dbt, CI/CD) can trigger quality gate
 <details>
 <summary><strong>📡 Click to view <code>curl</code> examples for Synchronous & Asynchronous Gates</strong></summary>
 
-#### 1. Synchronous Gate (`HTTP 200` Pass / `HTTP 422` Blocked)
+#### 1. Synchronous Gate (`HTTP 200` Pass / `HTTP 422` Blocked) — Supports `environment` & `target_schema_override`
 ```bash
 curl -i -X POST http://localhost:8000/api/v1/execution/run-gate \
   -H "Content-Type: application/json" \
@@ -148,7 +150,9 @@ curl -i -X POST http://localhost:8000/api/v1/execution/run-gate \
     "domain_id": "<DOMAIN_ID>",
     "triggered_by": "ORCHESTRATOR_API",
     "execution_mode": "SYNC",
-    "planning_cycle_id": "2026_W46_POR"
+    "planning_cycle_id": "2026_W46_POR",
+    "environment": "UAT",
+    "target_schema_override": "PDH_UAT_DB.PR_1042_SCHEMA"
   }'
 ```
 
@@ -176,5 +180,5 @@ curl -s http://localhost:8000/api/v1/runs/<RUN_ID> \
 
 ## 📚 Related Documentation
 - 🏗️ **[architecture.md](./architecture.md)** — High-level architecture, technology stack, integrations, working model, data flow, and database ER diagram.
-- 📖 **[frontend/src/app/help/page.tsx](./frontend/src/app/help/page.tsx)** — Built-in Help & Guide page (`/help`).
+- 📖 **[frontend/src/app/help/page.tsx](./frontend/src/app/help/page.tsx)** — Built-in self-service Help & Guide page (`/help`) with step-by-step screenshots, roles, glossary, and FAQ.
 - ⚙️ **[backend/app/config.py](./backend/app/config.py)** — Environment & Snowflake Cortex configuration.

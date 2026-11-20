@@ -112,3 +112,17 @@ async def add_team_member(
         user_role=r["USER_ROLE"],
         created_ts=r["CREATED_TS"],
     )
+
+
+@router.delete("/{team_id}/members/{member_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_team_member(
+    team_id: str,
+    member_id: str,
+    user: CurrentUser = Depends(require_role("ADMIN")),
+):
+    team = sf_client.get_team(team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail=f"Team '{team_id}' not found.")
+    deleted = sf_client.remove_team_member(team_id, member_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Member '{member_id}' not found in team.")

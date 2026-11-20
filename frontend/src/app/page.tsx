@@ -55,6 +55,14 @@ export default function ExecutiveDashboardPage() {
   const p1FailureTotal = runs.reduce((acc, r) => acc + r.metrics.p1_failures, 0);
   const p2FailureTotal = runs.reduce((acc, r) => acc + r.metrics.p2_failures, 0);
 
+  const latestRun = runs[0];
+  const confidenceScore = latestRun?.release_confidence_score ?? latestRun?.metrics.release_confidence_score ?? (approvedRules.length > 0 ? 100 : 0);
+  const coveragePct = latestRun?.coverage_pct ?? latestRun?.metrics.coverage_pct ?? Math.min(100, approvedRules.length * 20);
+  const totalRulesLatest = latestRun?.metrics.total_rules_run || 0;
+  const failedLatest = (latestRun?.metrics.p1_failures || 0) + (latestRun?.metrics.p2_failures || 0);
+  const passRate = totalRulesLatest > 0 ? Math.round(((totalRulesLatest - failedLatest) / totalRulesLatest) * 100) : 100;
+  const schemaStatus = latestRun?.schema_drift_status || "PASS";
+
   const categoryCounts = rules.reduce<Record<string, number>>((acc, r) => {
     const key = r.risk_category || "UNCATEGORIZED";
     acc[key] = (acc[key] || 0) + 1;
@@ -131,6 +139,49 @@ export default function ExecutiveDashboardPage() {
             <span className="text-sm font-normal text-slate-500">P2</span>
           </div>
           <div className="mt-1 text-xs text-slate-500">Across recent planning cycles</div>
+        </div>
+      </div>
+
+      {/* Release Confidence & Coverage Scorecard (Scope 1) */}
+      <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <ShieldCheck className={`h-6 w-6 ${confidenceScore >= 80 ? "text-emerald-500" : confidenceScore >= 50 ? "text-amber-500" : "text-rose-500"}`} />
+            <div>
+              <h2 className="text-sm font-semibold">Release Confidence &amp; Coverage Scorecard</h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Composite of Step-0 Schema Contract + P1/P2 Pass Rate + Column Test Coverage
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-6">
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-slate-500">Confidence</div>
+              <div className={`text-xl font-bold ${confidenceScore >= 80 ? "text-emerald-500" : confidenceScore >= 50 ? "text-amber-500" : "text-rose-500"}`}>
+                {loading ? "—" : `${confidenceScore.toFixed(1)}%`}
+              </div>
+            </div>
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-slate-500">Column Coverage</div>
+              <div className="text-xl font-bold text-blue-500">{loading ? "—" : `${coveragePct.toFixed(1)}%`}</div>
+            </div>
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-slate-500">Rule Pass Rate</div>
+              <div className="text-xl font-bold">{loading ? "—" : `${passRate}%`}</div>
+            </div>
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-slate-500">Schema Contract</div>
+              <span className={`inline-block rounded-full px-2.5 py-0.5 text-xs font-semibold ${schemaStatus === "DRIFT_DETECTED" ? "bg-rose-500/15 text-rose-500" : "bg-emerald-500/15 text-emerald-500"}`}>
+                {schemaStatus}
+              </span>
+            </div>
+          </div>
+        </div>
+        <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+          <div
+            className={`h-full transition-all ${confidenceScore >= 80 ? "bg-emerald-500" : confidenceScore >= 50 ? "bg-amber-500" : "bg-rose-500"}`}
+            style={{ width: `${Math.max(0, Math.min(100, confidenceScore))}%` }}
+          />
         </div>
       </div>
 

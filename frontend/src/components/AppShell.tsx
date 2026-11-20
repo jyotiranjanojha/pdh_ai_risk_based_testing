@@ -13,7 +13,6 @@ import {
   Moon,
   Plus,
   Settings,
-  ShieldCheck,
   Snowflake,
   Store,
   Sun,
@@ -107,13 +106,31 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/90 backdrop-blur dark:border-slate-800 dark:bg-[#0f172a]/90">
         <div className="flex w-full flex-wrap items-center justify-between gap-3 px-6 py-3">
           <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-600 text-white shadow-sm">
-              <ShieldCheck className="h-5 w-5" />
+            <div className="flex h-9 items-center justify-center rounded-lg bg-[#0068B5] px-2.5 shadow-sm">
+              <svg
+                viewBox="0 0 92 32"
+                className="h-6 w-auto"
+                aria-label="Intel"
+                role="img"
+              >
+                <rect x="4" y="4" width="5" height="5" rx="0.8" fill="#00C7FD" />
+                <text
+                  x="3"
+                  y="26"
+                  fill="#FFFFFF"
+                  fontFamily="Arial, Helvetica, sans-serif"
+                  fontWeight="700"
+                  fontSize="22"
+                  letterSpacing="-0.5"
+                >
+                  intel.
+                </text>
+              </svg>
             </div>
             <div>
               <div className="text-sm font-bold tracking-tight">Enterprise AI RBT Platform</div>
               <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                Snowflake Zero-Egress Control Plane · PDH v2.0
+                Snowflake Zero-Egress Control Plane · PDH v2.1
               </div>
             </div>
           </div>
@@ -134,16 +151,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   </option>
                 ))}
               </select>
-              <button
-                onClick={() => {
-                  setSettingsTab("new");
-                  setSettingsOpen(true);
-                }}
-                title="Create New Team Workspace (ADMIN)"
-                className="inline-flex items-center gap-1 rounded-lg border border-blue-500/40 bg-blue-500/10 px-2.5 py-1.5 text-xs font-semibold text-blue-500 hover:bg-blue-500/20"
-              >
-                <Plus className="h-3.5 w-3.5" /> New Team
-              </button>
+              {role === "ADMIN" && (
+                <button
+                  onClick={() => {
+                    setSettingsTab("new");
+                    setSettingsOpen(true);
+                  }}
+                  title="Create New Team Workspace (ADMIN)"
+                  className="inline-flex items-center gap-1 rounded-lg border border-blue-500/40 bg-blue-500/10 px-2.5 py-1.5 text-xs font-semibold text-blue-500 hover:bg-blue-500/20"
+                >
+                  <Plus className="h-3.5 w-3.5" /> New Team
+                </button>
+              )}
             </div>
 
             {/* Cortex Model Dropdown */}

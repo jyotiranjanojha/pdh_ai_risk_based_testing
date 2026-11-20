@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import sqlglot
+from fastapi import HTTPException
 
 from app.auth.dependencies import auth_lookup, hash_api_key
 from app.config import settings
@@ -20,8 +22,9 @@ from app.schemas.models import (
     GroundingContext,
     GroundingStatProfile,
     UserRole,
+    map_risk_score_to_priority,
 )
-from app.security.sql_validator import wrap_with_target_dataset_cte
+from app.security.sql_validator import sanitize_sql_identifier, wrap_with_target_dataset_cte
 
 
 def _utcnow_iso() -> str:
@@ -246,6 +249,9 @@ class SnowflakePlatformClient:
                     DOWNSTREAM_CONSUMER TEXT,
                     BUSINESS_CONTEXT TEXT,
                     CRITICALITY TEXT DEFAULT 'HIGH',
+                    BASELINE_SCHEMA_JSON TEXT,
+                    UPSTREAM_SOURCE_TABLE TEXT,
+                    TRANSFORMATION_SQL TEXT,
                     IS_ACTIVE INTEGER DEFAULT 1,
                     CREATED_TS TEXT NOT NULL
                 );
@@ -257,6 +263,9 @@ class SnowflakePlatformClient:
                     RISK_NAME TEXT NOT NULL,
                     RISK_CATEGORY TEXT,
                     RISK_PRIORITY TEXT NOT NULL,
+                    LIKELIHOOD_SCORE INTEGER DEFAULT 3,
+                    IMPACT_SCORE INTEGER DEFAULT 3,
+                    RISK_SCORE INTEGER DEFAULT 9,
                     BUSINESS_IMPACT_DESC TEXT,
                     VALIDATION_SQL TEXT NOT NULL,
                     STATUS TEXT DEFAULT 'DRAFT',
@@ -291,6 +300,12 @@ class SnowflakePlatformClient:
                     TOTAL_RULES_RUN INTEGER DEFAULT 0,
                     P1_FAILURES INTEGER DEFAULT 0,
                     P2_FAILURES INTEGER DEFAULT 0,
+                    ENVIRONMENT TEXT DEFAULT 'PROD',
+                    TARGET_SCHEMA_OVERRIDE TEXT,
+                    COVERAGE_PCT REAL,
+                    RELEASE_CONFIDENCE_SCORE REAL,
+                    SCHEMA_DRIFT_STATUS TEXT DEFAULT 'PASS',
+                    SCHEMA_DRIFT_DETAILS TEXT,
                     AI_TRIAGE_SUMMARY TEXT,
                     OVERRIDE_BY TEXT,
                     OVERRIDE_REASON TEXT,
@@ -413,8 +428,25 @@ class SnowflakePlatformClient:
             )
 
             # Seed Domains across all 6 Data Hubs
+            bom_baseline = json.dumps([
+                {"column_name": "ITEM_ID", "data_type": "TEXT", "numeric_precision": None, "numeric_scale": None, "is_nullable": True},
+                {"column_name": "SITE_ID", "data_type": "TEXT", "numeric_precision": None, "numeric_scale": None, "is_nullable": True},
+                {"column_name": "PARENT_SITE_ID", "data_type": "TEXT", "numeric_precision": None, "numeric_scale": None, "is_nullable": True},
+                {"column_name": "BOM_QTY", "data_type": "REAL", "numeric_precision": None, "numeric_scale": None, "is_nullable": True},
+                {"column_name": "FROZEN_HORIZON_FLAG", "data_type": "INTEGER", "numeric_precision": None, "numeric_scale": None, "is_nullable": True},
+                {"column_name": "PLANNING_CYCLE_ID", "data_type": "TEXT", "numeric_precision": None, "numeric_scale": None, "is_nullable": True},
+                {"column_name": "SNAPSHOT_TS", "data_type": "TEXT", "numeric_precision": None, "numeric_scale": None, "is_nullable": True},
+                {"column_name": "UPDATE_TS", "data_type": "TEXT", "numeric_precision": None, "numeric_scale": None, "is_nullable": True},
+                {"column_name": "DELETE_FLAG", "data_type": "INTEGER", "numeric_precision": None, "numeric_scale": None, "is_nullable": True},
+            ])
             cur.executemany(
-                "INSERT INTO RBT_DOMAIN_REGISTRY VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO RBT_DOMAIN_REGISTRY
+                (DOMAIN_ID, TEAM_ID, DOMAIN_NAME, TARGET_SCHEMA, TARGET_TABLE, RELATED_TABLES,
+                 TEMPORAL_CYCLE_COLUMN, SNAPSHOT_TS_COLUMN, MAX_HIERARCHY_DEPTH, DOWNSTREAM_CONSUMER,
+                 BUSINESS_CONTEXT, CRITICALITY, BASELINE_SCHEMA_JSON, UPSTREAM_SOURCE_TABLE, TRANSFORMATION_SQL, IS_ACTIVE, CREATED_TS)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 [
                     (
                         "dom_intersite_bom",
@@ -429,6 +461,9 @@ class SnowflakePlatformClient:
                         "PLANNING_SOLVER",
                         "Multi-echelon intersite bill-of-materials network for IP Supply Planning. Circular parent-child site loops or frozen-horizon overrides crash the weekly POR solver.",
                         "CRITICAL",
+                        bom_baseline,
+                        None,
+                        None,
                         1,
                         now,
                     ),
@@ -445,6 +480,9 @@ class SnowflakePlatformClient:
                         "PLANNING_SOLVER",
                         "Weekly Plan of Record demand netting table. Negative net demand or frozen-week supply spikes violate planning stability.",
                         "CRITICAL",
+                        None,
+                        None,
+                        None,
                         1,
                         now,
                     ),
@@ -461,6 +499,9 @@ class SnowflakePlatformClient:
                         "DEMAND_FORECAST_ENGINE",
                         "IP Demand Planning weekly consensus forecast & netting feed.",
                         "CRITICAL",
+                        None,
+                        None,
+                        None,
                         1,
                         now,
                     ),
@@ -477,6 +518,9 @@ class SnowflakePlatformClient:
                         "MRP_ENGINE",
                         "IP Material Planning substrate & component BOM explosion.",
                         "HIGH",
+                        None,
+                        None,
+                        None,
                         1,
                         now,
                     ),
@@ -493,6 +537,9 @@ class SnowflakePlatformClient:
                         "FOUNDRY_SOLVER",
                         "Intel Foundry multi-fab wafer supply & intersite transfer network.",
                         "CRITICAL",
+                        None,
+                        None,
+                        None,
                         1,
                         now,
                     ),
@@ -509,6 +556,9 @@ class SnowflakePlatformClient:
                         "FOUNDRY_DEMAND_MART",
                         "Intel Foundry customer POR demand netting and backlog reconciliation.",
                         "HIGH",
+                        None,
+                        None,
+                        None,
                         1,
                         now,
                     ),
@@ -525,6 +575,9 @@ class SnowflakePlatformClient:
                         "FOUNDRY_MRP",
                         "Intel Foundry raw wafer and mask-set material allocation.",
                         "HIGH",
+                        None,
+                        None,
+                        None,
                         1,
                         now,
                     ),
@@ -577,18 +630,24 @@ class SnowflakePlatformClient:
             )
 
             cur.executemany(
-                "INSERT INTO RBT_TEST_RULES VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO RBT_TEST_RULES
+                (RULE_ID, TEAM_ID, DOMAIN_ID, RISK_NAME, RISK_CATEGORY, RISK_PRIORITY,
+                 LIKELIHOOD_SCORE, IMPACT_SCORE, RISK_SCORE, BUSINESS_IMPACT_DESC, VALIDATION_SQL,
+                 STATUS, LAST_COMPILE_ERROR, IS_SHARED_TEMPLATE, CREATED_BY, APPROVED_BY, UPDATED_TS)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 [
-                    ("rule_bom_loop_01", "team_ip_supply", "dom_intersite_bom", "Intersite BOM Circular Hierarchy Loop", "HIERARCHY_LOOP", "P1_BLOCKER", "Self-referencing or circular parent-child site links cause infinite traversal in the Planning Solver.", bom_loop_sql, "APPROVED", None, 0, "pdh.author@enterprise.com", "pdh.lead@enterprise.com", now),
-                    ("rule_bom_frozen_02", "team_ip_supply", "dom_intersite_bom", "Frozen Horizon Modification Violation", "FROZEN_HORIZON_VIOLATION", "P1_BLOCKER", "Zero or negative BOM quantities inside the frozen planning horizon corrupt committed factory schedules.", bom_frozen_sql, "APPROVED", None, 0, "pdh.author@enterprise.com", "pdh.lead@enterprise.com", now),
-                    ("rule_bom_dup_03", "team_ip_supply", "dom_intersite_bom", "Duplicate Intersite BOM Natural Key", "DUPLICATE_KEY", "P2_WARNING", "Duplicate (ITEM_ID, SITE_ID, PARENT_SITE_ID) rows cause double-counting in capacity rollups.", bom_dup_sql, "APPROVED", None, 0, "pdh.author@enterprise.com", "pdh.lead@enterprise.com", now),
-                    ("rule_netting_neg_04", "team_ip_supply", "dom_demand_netting", "Negative Net Demand Boundary Violation", "BOUNDARY_VALUE", "P1_BLOCKER", "Negative net demand violates solver non-negativity constraints.", netting_neg_sql, "APPROVED", None, 0, "pdh.author@enterprise.com", "pdh.lead@enterprise.com", now),
-                    ("rule_bom_draft_05", "team_ip_supply", "dom_intersite_bom", "Null Item or Site Key Check", "REFERENTIAL_INTEGRITY", "P2_WARNING", "Missing ITEM_ID or SITE_ID prevents downstream ERP join.", bom_draft_sql, "DRAFT", None, 0, "pdh.author@enterprise.com", None, now),
-                    ("rule_ip_dem_01", "team_ip_demand", "dom_ip_demand_fcst", "Negative Consensus Net Demand Check", "BOUNDARY_VALUE", "P1_BLOCKER", "Ensures consensus demand netting never goes negative before forecast engine consumption.", netting_neg_sql, "APPROVED", None, 1, "pdh.admin@enterprise.com", "pdh.lead@enterprise.com", now),
-                    ("rule_ip_mat_01", "team_ip_material", "dom_ip_mat_bom", "Material BOM Circular Component Loop", "HIERARCHY_LOOP", "P1_BLOCKER", "Detects circular parent-child component links in MRP explosion.", bom_loop_sql, "APPROVED", None, 0, "pdh.admin@enterprise.com", "pdh.lead@enterprise.com", now),
-                    ("rule_if_sup_01", "team_if_supply", "dom_if_sup_cap", "Foundry Intersite Supply Loop Guard", "HIERARCHY_LOOP", "P1_BLOCKER", "Prevents circular fab-to-fab wafer transfer loops in Foundry Solver.", bom_loop_sql, "APPROVED", None, 0, "pdh.admin@enterprise.com", "pdh.lead@enterprise.com", now),
-                    ("rule_if_dem_01", "team_if_demand", "dom_if_dem_por", "Foundry POR Negative Demand Guard", "BOUNDARY_VALUE", "P1_BLOCKER", "Blocks negative POR demand rows from reaching Foundry Demand Mart.", netting_neg_sql, "APPROVED", None, 0, "pdh.admin@enterprise.com", "pdh.lead@enterprise.com", now),
-                    ("rule_if_mat_01", "team_if_material", "dom_if_mat_sub", "Foundry Duplicate Material Allocation Key", "DUPLICATE_KEY", "P1_BLOCKER", "Duplicate (ITEM_ID, SITE_ID, PARENT_SITE_ID) allocation keys break Foundry MRP.", bom_dup_sql, "APPROVED", None, 1, "pdh.admin@enterprise.com", "pdh.lead@enterprise.com", now),
+                    ("rule_bom_loop_01", "team_ip_supply", "dom_intersite_bom", "Intersite BOM Circular Hierarchy Loop", "HIERARCHY_LOOP", "P1_BLOCKER", 4, 5, 20, "Self-referencing or circular parent-child site links cause infinite traversal in the Planning Solver.", bom_loop_sql, "APPROVED", None, 0, "pdh.author@enterprise.com", "pdh.lead@enterprise.com", now),
+                    ("rule_bom_frozen_02", "team_ip_supply", "dom_intersite_bom", "Frozen Horizon Modification Violation", "FROZEN_HORIZON_VIOLATION", "P1_BLOCKER", 4, 5, 20, "Zero or negative BOM quantities inside the frozen planning horizon corrupt committed factory schedules.", bom_frozen_sql, "APPROVED", None, 0, "pdh.author@enterprise.com", "pdh.lead@enterprise.com", now),
+                    ("rule_bom_dup_03", "team_ip_supply", "dom_intersite_bom", "Duplicate Intersite BOM Natural Key", "DUPLICATE_KEY", "P2_WARNING", 3, 4, 12, "Duplicate (ITEM_ID, SITE_ID, PARENT_SITE_ID) rows cause double-counting in capacity rollups.", bom_dup_sql, "APPROVED", None, 0, "pdh.author@enterprise.com", "pdh.lead@enterprise.com", now),
+                    ("rule_netting_neg_04", "team_ip_supply", "dom_demand_netting", "Negative Net Demand Boundary Violation", "BOUNDARY_VALUE", "P1_BLOCKER", 4, 4, 16, "Negative net demand violates solver non-negativity constraints.", netting_neg_sql, "APPROVED", None, 0, "pdh.author@enterprise.com", "pdh.lead@enterprise.com", now),
+                    ("rule_bom_draft_05", "team_ip_supply", "dom_intersite_bom", "Null Item or Site Key Check", "REFERENTIAL_INTEGRITY", "P2_WARNING", 3, 3, 9, "Missing ITEM_ID or SITE_ID prevents downstream ERP join.", bom_draft_sql, "DRAFT", None, 0, "pdh.author@enterprise.com", None, now),
+                    ("rule_ip_dem_01", "team_ip_demand", "dom_ip_demand_fcst", "Negative Consensus Net Demand Check", "BOUNDARY_VALUE", "P1_BLOCKER", 4, 5, 20, "Ensures consensus demand netting never goes negative before forecast engine consumption.", netting_neg_sql, "APPROVED", None, 1, "pdh.admin@enterprise.com", "pdh.lead@enterprise.com", now),
+                    ("rule_ip_mat_01", "team_ip_material", "dom_ip_mat_bom", "Material BOM Circular Component Loop", "HIERARCHY_LOOP", "P1_BLOCKER", 4, 5, 20, "Detects circular parent-child component links in MRP explosion.", bom_loop_sql, "APPROVED", None, 0, "pdh.admin@enterprise.com", "pdh.lead@enterprise.com", now),
+                    ("rule_if_sup_01", "team_if_supply", "dom_if_sup_cap", "Foundry Intersite Supply Loop Guard", "HIERARCHY_LOOP", "P1_BLOCKER", 5, 5, 25, "Prevents circular fab-to-fab wafer transfer loops in Foundry Solver.", bom_loop_sql, "APPROVED", None, 0, "pdh.admin@enterprise.com", "pdh.lead@enterprise.com", now),
+                    ("rule_if_dem_01", "team_if_demand", "dom_if_dem_por", "Foundry POR Negative Demand Guard", "BOUNDARY_VALUE", "P1_BLOCKER", 4, 4, 16, "Blocks negative POR demand rows from reaching Foundry Demand Mart.", netting_neg_sql, "APPROVED", None, 0, "pdh.admin@enterprise.com", "pdh.lead@enterprise.com", now),
+                    ("rule_if_mat_01", "team_if_material", "dom_if_mat_sub", "Foundry Duplicate Material Allocation Key", "DUPLICATE_KEY", "P1_BLOCKER", 4, 4, 16, "Duplicate (ITEM_ID, SITE_ID, PARENT_SITE_ID) allocation keys break Foundry MRP.", bom_dup_sql, "APPROVED", None, 1, "pdh.admin@enterprise.com", "pdh.lead@enterprise.com", now),
                 ],
             )
 
@@ -644,7 +703,12 @@ class SnowflakePlatformClient:
             # Seed Pre-Existing BLOCKED_DOWNSTREAM Run (ready for CSV export & Break-Glass Override)
             cur.execute(
                 """
-                INSERT INTO RBT_EXECUTION_RUNS VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO RBT_EXECUTION_RUNS
+                (RUN_ID, TEAM_ID, DOMAIN_ID, TRIGGERED_BY, EXECUTION_STATUS, PLANNING_CYCLE_ID, SNAPSHOT_TS,
+                 GATE_DECISION, TOTAL_RULES_RUN, P1_FAILURES, P2_FAILURES, ENVIRONMENT, TARGET_SCHEMA_OVERRIDE,
+                 COVERAGE_PCT, RELEASE_CONFIDENCE_SCORE, SCHEMA_DRIFT_STATUS, SCHEMA_DRIFT_DETAILS,
+                 AI_TRIAGE_SUMMARY, OVERRIDE_BY, OVERRIDE_REASON, OVERRIDE_TS, RUN_TS, COMPLETED_TS)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "run_9f82c1a0",
@@ -658,6 +722,12 @@ class SnowflakePlatformClient:
                     3,
                     1,
                     1,
+                    "PROD",
+                    None,
+                    66.7,
+                    48.3,
+                    "PASS",
+                    "[]",
                     "Downstream solver export blocked: 142 circular parent-child loops detected in Intersite BOM for cycle 2025_W42_POR, which would cause infinite netting traversal.",
                     None,
                     None,
@@ -885,24 +955,75 @@ class SnowflakePlatformClient:
             conn.close()
 
     def add_team_member(self, team_id: str, user_email: str, user_role: str) -> Dict[str, Any]:
-        member_id = _new_id("mem")
+        clean_email = user_email.strip().lower()
         now = _utcnow_iso()
         if settings.SNOWFLAKE_MOCK_MODE:
-            self._mock_execute(
-                "INSERT INTO RBT_TEAM_MEMBERS VALUES (?, ?, ?, ?, ?)",
-                (member_id, team_id, user_email, user_role, now),
+            existing = self._mock_fetchall(
+                "SELECT * FROM RBT_TEAM_MEMBERS WHERE TEAM_ID = ? AND LOWER(USER_EMAIL) = LOWER(?)",
+                (team_id, clean_email),
             )
+            if existing:
+                member_id = existing[0]["MEMBER_ID"]
+                self._mock_execute(
+                    "UPDATE RBT_TEAM_MEMBERS SET USER_ROLE = ? WHERE MEMBER_ID = ?",
+                    (user_role, member_id),
+                )
+            else:
+                member_id = _new_id("mem")
+                self._mock_execute(
+                    "INSERT INTO RBT_TEAM_MEMBERS VALUES (?, ?, ?, ?, ?)",
+                    (member_id, team_id, clean_email, user_role, now),
+                )
             return self._mock_fetchall("SELECT * FROM RBT_TEAM_MEMBERS WHERE MEMBER_ID = ?", (member_id,))[0]
+
         conn = self._get_live_connection()
         try:
             cur = conn.cursor()
             cur.execute(
-                f"INSERT INTO {self._meta_prefix}.RBT_TEAM_MEMBERS (MEMBER_ID, TEAM_ID, USER_EMAIL, USER_ROLE) VALUES (%s, %s, %s, %s)",
-                (member_id, team_id, user_email, user_role),
+                f"SELECT MEMBER_ID FROM {self._meta_prefix}.RBT_TEAM_MEMBERS WHERE TEAM_ID = %s AND LOWER(USER_EMAIL) = LOWER(%s)",
+                (team_id, clean_email),
             )
+            row = cur.fetchone()
+            if row:
+                member_id = row[0]
+                cur.execute(
+                    f"UPDATE {self._meta_prefix}.RBT_TEAM_MEMBERS SET USER_ROLE = %s WHERE MEMBER_ID = %s",
+                    (user_role, member_id),
+                )
+            else:
+                member_id = _new_id("mem")
+                cur.execute(
+                    f"INSERT INTO {self._meta_prefix}.RBT_TEAM_MEMBERS (MEMBER_ID, TEAM_ID, USER_EMAIL, USER_ROLE) VALUES (%s, %s, %s, %s)",
+                    (member_id, team_id, clean_email, user_role),
+                )
             cur.execute(f"SELECT * FROM {self._meta_prefix}.RBT_TEAM_MEMBERS WHERE MEMBER_ID = %s", (member_id,))
             cols = [d[0] for d in cur.description]
             return dict(zip(cols, cur.fetchone()))
+        finally:
+            conn.close()
+
+    def remove_team_member(self, team_id: str, member_id: str) -> bool:
+        if settings.SNOWFLAKE_MOCK_MODE:
+            existing = self._mock_fetchall(
+                "SELECT MEMBER_ID FROM RBT_TEAM_MEMBERS WHERE TEAM_ID = ? AND MEMBER_ID = ?",
+                (team_id, member_id),
+            )
+            if not existing:
+                return False
+            self._mock_execute(
+                "DELETE FROM RBT_TEAM_MEMBERS WHERE TEAM_ID = ? AND MEMBER_ID = ?",
+                (team_id, member_id),
+            )
+            return True
+
+        conn = self._get_live_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"DELETE FROM {self._meta_prefix}.RBT_TEAM_MEMBERS WHERE TEAM_ID = %s AND MEMBER_ID = %s",
+                (team_id, member_id),
+            )
+            return cur.rowcount > 0
         finally:
             conn.close()
 
@@ -963,42 +1084,183 @@ class SnowflakePlatformClient:
         finally:
             conn.close()
 
-    def create_domain(self, team_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        domain_id = _new_id("dom")
-        now = _utcnow_iso()
-        related_json = json.dumps(data.get("related_tables", []))
-        if settings.SNOWFLAKE_MOCK_MODE:
-            self._mock_execute(
-                "INSERT INTO RBT_DOMAIN_REGISTRY VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    domain_id,
-                    team_id,
-                    data["domain_name"],
-                    data["target_schema"],
-                    data["target_table"],
-                    related_json,
-                    data.get("temporal_cycle_column"),
-                    data.get("snapshot_ts_column"),
-                    data.get("max_hierarchy_depth", 10),
-                    data.get("downstream_consumer"),
-                    data.get("business_context"),
-                    data.get("criticality", "HIGH"),
-                    1,
-                    now,
-                ),
-            )
-            return self.get_domain(domain_id)  # type: ignore[return-value]
+    @staticmethod
+    def _parse_type_dims(data_type: str, precision: Optional[int] = None, scale: Optional[int] = None) -> Tuple[str, Optional[int], Optional[int]]:
+        dt = (data_type or "").strip().upper()
+        m = re.match(r"^([A-Z0-9_]+)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)$", dt)
+        if m:
+            base = m.group(1)
+            p = int(m.group(2)) if precision is None else precision
+            s = int(m.group(3)) if (m.group(3) is not None and scale is None) else scale
+            return base, p, s
+        return dt.split("(")[0].strip(), precision, scale
 
-        conn = self._get_live_connection()
+    @classmethod
+    def compare_schema_contracts(
+        cls,
+        baseline_cols: List[Dict[str, Any]],
+        current_cols: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Compare current target schema against BASELINE_SCHEMA_JSON for dropped or narrowed columns."""
+        if not baseline_cols:
+            return {"status": "SKIPPED", "drifts": []}
+        if not current_cols:
+            return {
+                "status": "DRIFT_DETECTED",
+                "drifts": [{"column_name": "*", "issue": "TARGET_TABLE_MISSING", "detail": "Target table or view returned 0 columns."}],
+            }
+
+        cur_map = {str(c["column_name"]).upper(): c for c in current_cols}
+        drifts: List[Dict[str, Any]] = []
+        numeric_types = {"NUMBER", "DECIMAL", "NUMERIC", "INT", "INTEGER", "BIGINT", "SMALLINT", "FLOAT", "DOUBLE", "REAL"}
+
+        for base in baseline_cols:
+            col_name = str(base["column_name"]).upper()
+            if col_name not in cur_map:
+                drifts.append(
+                    {
+                        "column_name": col_name,
+                        "issue": "DROPPED_COLUMN",
+                        "baseline_type": base.get("data_type"),
+                        "current_type": None,
+                        "detail": f"Column '{col_name}' ({base.get('data_type')}) was dropped from target table.",
+                    }
+                )
+                continue
+
+            cur = cur_map[col_name]
+            b_type, b_prec, b_scale = cls._parse_type_dims(
+                str(base.get("data_type") or ""),
+                base.get("numeric_precision"),
+                base.get("numeric_scale"),
+            )
+            c_type, c_prec, c_scale = cls._parse_type_dims(
+                str(cur.get("data_type") or ""),
+                cur.get("numeric_precision"),
+                cur.get("numeric_scale"),
+            )
+
+            # Precision / scale narrowing
+            if b_prec is not None and c_prec is not None and c_prec < b_prec:
+                drifts.append(
+                    {
+                        "column_name": col_name,
+                        "issue": "PRECISION_NARROWED",
+                        "baseline_type": f"{b_type}({b_prec},{b_scale})" if b_scale is not None else f"{b_type}({b_prec})",
+                        "current_type": f"{c_type}({c_prec},{c_scale})" if c_scale is not None else f"{c_type}({c_prec})",
+                        "detail": f"Column '{col_name}' precision narrowed from {b_prec} to {c_prec}.",
+                    }
+                )
+            elif b_scale is not None and c_scale is not None and c_scale < b_scale:
+                drifts.append(
+                    {
+                        "column_name": col_name,
+                        "issue": "SCALE_NARROWED",
+                        "baseline_type": f"{b_type}({b_prec},{b_scale})",
+                        "current_type": f"{c_type}({c_prec},{c_scale})",
+                        "detail": f"Column '{col_name}' scale narrowed from {b_scale} to {c_scale}.",
+                    }
+                )
+            elif b_type in numeric_types and c_type not in numeric_types:
+                drifts.append(
+                    {
+                        "column_name": col_name,
+                        "issue": "INCOMPATIBLE_TYPE_CHANGE",
+                        "baseline_type": base.get("data_type"),
+                        "current_type": cur.get("data_type"),
+                        "detail": f"Column '{col_name}' type changed from {base.get('data_type')} to {cur.get('data_type')}.",
+                    }
+                )
+
+        return {
+            "status": "DRIFT_DETECTED" if drifts else "PASS",
+            "drifts": drifts,
+        }
+
+    def _fetch_table_schema_snapshot(
+        self,
+        team: Dict[str, Any],
+        target_schema: str,
+        target_table: str,
+    ) -> List[Dict[str, Any]]:
+        db_name = team["SNOWFLAKE_DATABASE"]
+        schema_parts = [p.strip().strip('"').upper() for p in target_schema.split(".") if p.strip()]
+        if len(schema_parts) >= 3:
+            db_name, norm_schema, norm_table = schema_parts[0], schema_parts[1], schema_parts[2]
+        elif len(schema_parts) == 2:
+            db_name, norm_schema = schema_parts[0], schema_parts[1]
+            norm_table = target_table.strip().strip('"').upper()
+        else:
+            norm_schema = schema_parts[0] if schema_parts else target_schema.strip().strip('"').upper()
+            norm_table = target_table.strip().strip('"').upper()
+
+        table_parts = [p.strip().strip('"').upper() for p in norm_table.split(".") if p.strip()]
+        if len(table_parts) >= 3:
+            db_name, norm_schema, norm_table = table_parts[0], table_parts[1], table_parts[2]
+        elif len(table_parts) == 2:
+            norm_schema, norm_table = table_parts[0], table_parts[1]
+
+        if settings.SNOWFLAKE_MOCK_MODE:
+            pragma_rows = self._mock_fetchall(f"PRAGMA table_info({norm_table})")
+            return [
+                {
+                    "column_name": pr["name"],
+                    "data_type": pr["type"] or "TEXT",
+                    "numeric_precision": None,
+                    "numeric_scale": None,
+                    "is_nullable": pr["notnull"] == 0,
+                }
+                for pr in pragma_rows
+            ]
+
+        conn = self._get_live_connection(warehouse=team["SNOWFLAKE_WAREHOUSE"])
         try:
             cur = conn.cursor()
             cur.execute(
                 f"""
-                INSERT INTO {self._meta_prefix}.RBT_DOMAIN_REGISTRY
+                SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE
+                FROM {db_name}.INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                ORDER BY ORDINAL_POSITION
+                """,
+                (norm_schema, norm_table),
+            )
+            return [
+                {
+                    "column_name": r[0],
+                    "data_type": r[1],
+                    "numeric_precision": int(r[2]) if r[2] is not None else None,
+                    "numeric_scale": int(r[3]) if r[3] is not None else None,
+                    "is_nullable": r[4] == "YES",
+                }
+                for r in cur.fetchall()
+            ]
+        except Exception:
+            return []
+        finally:
+            conn.close()
+
+    def create_domain(self, team_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        domain_id = _new_id("dom")
+        now = _utcnow_iso()
+        related_json = json.dumps(data.get("related_tables", []))
+        team = self.get_team(team_id)
+        baseline_cols: List[Dict[str, Any]] = []
+        if team:
+            baseline_cols = self._fetch_table_schema_snapshot(
+                team, data["target_schema"], data["target_table"]
+            )
+        baseline_json = json.dumps(baseline_cols) if baseline_cols else None
+
+        if settings.SNOWFLAKE_MOCK_MODE:
+            self._mock_execute(
+                """
+                INSERT INTO RBT_DOMAIN_REGISTRY
                 (DOMAIN_ID, TEAM_ID, DOMAIN_NAME, TARGET_SCHEMA, TARGET_TABLE, RELATED_TABLES,
                  TEMPORAL_CYCLE_COLUMN, SNAPSHOT_TS_COLUMN, MAX_HIERARCHY_DEPTH, DOWNSTREAM_CONSUMER,
-                 BUSINESS_CONTEXT, CRITICALITY)
-                SELECT %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, %s, %s, %s, %s, %s
+                 BUSINESS_CONTEXT, CRITICALITY, BASELINE_SCHEMA_JSON, UPSTREAM_SOURCE_TABLE,
+                 TRANSFORMATION_SQL, IS_ACTIVE, CREATED_TS)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     domain_id,
@@ -1013,11 +1275,99 @@ class SnowflakePlatformClient:
                     data.get("downstream_consumer"),
                     data.get("business_context"),
                     data.get("criticality", "HIGH"),
+                    baseline_json,
+                    data.get("upstream_source_table"),
+                    data.get("transformation_sql"),
+                    1,
+                    now,
+                ),
+            )
+            return self.get_domain(domain_id)  # type: ignore[return-value]
+
+        conn = self._get_live_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                INSERT INTO {self._meta_prefix}.RBT_DOMAIN_REGISTRY
+                (DOMAIN_ID, TEAM_ID, DOMAIN_NAME, TARGET_SCHEMA, TARGET_TABLE, RELATED_TABLES,
+                 TEMPORAL_CYCLE_COLUMN, SNAPSHOT_TS_COLUMN, MAX_HIERARCHY_DEPTH, DOWNSTREAM_CONSUMER,
+                 BUSINESS_CONTEXT, CRITICALITY, BASELINE_SCHEMA_JSON, UPSTREAM_SOURCE_TABLE, TRANSFORMATION_SQL)
+                SELECT %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, %s, %s, %s, %s, %s, TRY_PARSE_JSON(%s), %s, %s
+                """,
+                (
+                    domain_id,
+                    team_id,
+                    data["domain_name"],
+                    data["target_schema"],
+                    data["target_table"],
+                    related_json,
+                    data.get("temporal_cycle_column"),
+                    data.get("snapshot_ts_column"),
+                    data.get("max_hierarchy_depth", 10),
+                    data.get("downstream_consumer"),
+                    data.get("business_context"),
+                    data.get("criticality", "HIGH"),
+                    baseline_json,
+                    data.get("upstream_source_table"),
+                    data.get("transformation_sql"),
                 ),
             )
             return self.get_domain(domain_id)  # type: ignore[return-value]
         finally:
             conn.close()
+
+    def rebaseline_domain_schema(self, team: Dict[str, Any], domain: Dict[str, Any]) -> List[Dict[str, Any]]:
+        snapshot = self._fetch_table_schema_snapshot(team, domain["TARGET_SCHEMA"], domain["TARGET_TABLE"])
+        baseline_json = json.dumps(snapshot)
+        if settings.SNOWFLAKE_MOCK_MODE:
+            self._mock_execute(
+                "UPDATE RBT_DOMAIN_REGISTRY SET BASELINE_SCHEMA_JSON = ? WHERE DOMAIN_ID = ?",
+                (baseline_json, domain["DOMAIN_ID"]),
+            )
+            return snapshot
+
+        conn = self._get_live_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE {self._meta_prefix}.RBT_DOMAIN_REGISTRY SET BASELINE_SCHEMA_JSON = PARSE_JSON(%s) WHERE DOMAIN_ID = %s",
+                (baseline_json, domain["DOMAIN_ID"]),
+            )
+            return snapshot
+        finally:
+            conn.close()
+
+    def detect_schema_drift(
+        self,
+        team: Dict[str, Any],
+        domain: Dict[str, Any],
+        target_schema_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        raw_baseline = domain.get("BASELINE_SCHEMA_JSON")
+        if isinstance(raw_baseline, str) and raw_baseline:
+            try:
+                baseline_cols = json.loads(raw_baseline)
+            except Exception:
+                baseline_cols = []
+        elif isinstance(raw_baseline, list):
+            baseline_cols = raw_baseline
+        else:
+            baseline_cols = []
+
+        if not baseline_cols:
+            return {"status": "SKIPPED", "drifts": []}
+
+        effective_schema = target_schema_override or domain["TARGET_SCHEMA"]
+        effective_table = domain["TARGET_TABLE"]
+        if settings.SNOWFLAKE_MOCK_MODE and target_schema_override:
+            # In mock mode, check if a schema-prefixed override table exists (e.g. UAT_INTERSITE_BOM)
+            candidate = f"{target_schema_override.split('.')[-1]}_{effective_table}"
+            if self._mock_fetchall(f"PRAGMA table_info({candidate})"):
+                effective_table = candidate
+
+        current_cols = self._fetch_table_schema_snapshot(team, effective_schema, effective_table)
+        return self.compare_schema_contracts(baseline_cols, current_cols)
 
     def ground_domain_metadata(self, team: Dict[str, Any], domain: Dict[str, Any]) -> GroundingContext:
         """
@@ -1272,6 +1622,8 @@ class SnowflakePlatformClient:
                         "risk_name": "Auto-Corrected Key Integrity Check",
                         "risk_category": "REFERENTIAL_INTEGRITY",
                         "risk_priority": "P2_WARNING",
+                        "likelihood_score": 3,
+                        "impact_score": 4,
                         "business_impact_desc": "Auto-repaired SQL after Snowflake compile feedback.",
                         "validation_sql": f"SELECT {first_col} FROM __TARGET_DATASET__ WHERE {first_col} IS NULL",
                     }
@@ -1288,6 +1640,8 @@ class SnowflakePlatformClient:
                 "risk_name": f"{domain_name} Duplicate Natural Key",
                 "risk_category": "DUPLICATE_KEY",
                 "risk_priority": "P1_BLOCKER",
+                "likelihood_score": 4,
+                "impact_score": 5,
                 "business_impact_desc": f"Duplicate {pk} rows cause downstream aggregation inflation.",
                 "validation_sql": f"SELECT {pk}, COUNT(*) AS CNT FROM __TARGET_DATASET__ GROUP BY {pk} HAVING COUNT(*) > 1",
             },
@@ -1295,6 +1649,8 @@ class SnowflakePlatformClient:
                 "risk_name": f"{domain_name} Null Key Completeness",
                 "risk_category": "REFERENTIAL_INTEGRITY",
                 "risk_priority": "P1_BLOCKER",
+                "likelihood_score": 4,
+                "impact_score": 4,
                 "business_impact_desc": f"Null {pk} breaks downstream joins.",
                 "validation_sql": f"SELECT * FROM __TARGET_DATASET__ WHERE {pk} IS NULL",
             },
@@ -1302,6 +1658,8 @@ class SnowflakePlatformClient:
                 "risk_name": f"{domain_name} Freshness SLA Check",
                 "risk_category": "FRESHNESS_ANOMALY",
                 "risk_priority": "P2_WARNING",
+                "likelihood_score": 3,
+                "impact_score": 4,
                 "business_impact_desc": "Detects rows missing UPDATE_TS audit timestamp.",
                 "validation_sql": f"SELECT {pk} FROM __TARGET_DATASET__ WHERE {'UPDATE_TS' if 'UPDATE_TS' in cols else pk} IS NULL",
             },
@@ -1309,6 +1667,8 @@ class SnowflakePlatformClient:
                 "risk_name": f"{domain_name} Boundary Non-Negativity Check",
                 "risk_category": "BOUNDARY_VALUE",
                 "risk_priority": "P2_WARNING",
+                "likelihood_score": 3,
+                "impact_score": 4,
                 "business_impact_desc": "Flags unexpected negative quantities or amounts.",
                 "validation_sql": (
                     f"SELECT {pk}, BOM_QTY FROM __TARGET_DATASET__ WHERE BOM_QTY < 0"
@@ -1320,6 +1680,8 @@ class SnowflakePlatformClient:
                 "risk_name": f"{domain_name} Bounded Hierarchy Recursion Check",
                 "risk_category": "HIERARCHY_LOOP",
                 "risk_priority": "P1_BLOCKER",
+                "likelihood_score": 4,
+                "impact_score": 5,
                 "business_impact_desc": f"Prevents circular parent-child loops (bounded at depth <= {max_depth}).",
                 "validation_sql": (
                     f"WITH RECURSIVE tree AS (\n"
@@ -1332,6 +1694,34 @@ class SnowflakePlatformClient:
                 ),
             },
         ]
+
+        upstream = domain.get("UPSTREAM_SOURCE_TABLE") if domain else None
+        if upstream:
+            rules.append(
+                {
+                    "risk_name": f"{domain_name} Staging-to-Publish Reconciliation",
+                    "risk_category": "PIPELINE_RECONCILIATION",
+                    "risk_priority": "P1_BLOCKER",
+                    "likelihood_score": 4,
+                    "impact_score": 5,
+                    "business_impact_desc": f"Detects row-count or key-metric drift between upstream {upstream} and target {domain_name}.",
+                    "validation_sql": f"SELECT {pk}, COUNT(*) AS TARGET_CNT FROM __TARGET_DATASET__ GROUP BY {pk} HAVING COUNT(*) < 0",
+                }
+            )
+
+        if "TRANSFORMATION_SQL" in prompt or "PR_SQL_DIFF" in prompt:
+            rules.append(
+                {
+                    "risk_name": f"{domain_name} Transformation Logic Edge-Case Guard",
+                    "risk_category": "BOUNDARY_VALUE",
+                    "risk_priority": "P2_WARNING",
+                    "likelihood_score": 3,
+                    "impact_score": 4,
+                    "business_impact_desc": "Validates edge-case predicates and CASE/JOIN outputs introduced in pipeline transformation SQL / PR diff.",
+                    "validation_sql": f"SELECT {pk} FROM __TARGET_DATASET__ WHERE {pk} IS NULL",
+                }
+            )
+
         return {"generated_rules": rules}
 
     def invoke_cortex_text(
@@ -1494,16 +1884,29 @@ class SnowflakePlatformClient:
     def insert_rule(self, rule: Dict[str, Any]) -> Dict[str, Any]:
         rule_id = rule.get("rule_id") or _new_id("rule")
         now = _utcnow_iso()
+        likelihood = int(rule.get("likelihood_score") or 3)
+        impact = int(rule.get("impact_score") or 3)
+        risk_score = likelihood * impact
+        risk_priority = rule.get("risk_priority") or map_risk_score_to_priority(risk_score)
         if settings.SNOWFLAKE_MOCK_MODE:
             self._mock_execute(
-                "INSERT INTO RBT_TEST_RULES VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO RBT_TEST_RULES
+                (RULE_ID, TEAM_ID, DOMAIN_ID, RISK_NAME, RISK_CATEGORY, RISK_PRIORITY,
+                 LIKELIHOOD_SCORE, IMPACT_SCORE, RISK_SCORE, BUSINESS_IMPACT_DESC, VALIDATION_SQL,
+                 STATUS, LAST_COMPILE_ERROR, IS_SHARED_TEMPLATE, CREATED_BY, APPROVED_BY, UPDATED_TS)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     rule_id,
                     rule["team_id"],
                     rule["domain_id"],
                     rule["risk_name"],
                     rule.get("risk_category"),
-                    rule["risk_priority"],
+                    risk_priority,
+                    likelihood,
+                    impact,
+                    risk_score,
                     rule.get("business_impact_desc"),
                     rule["validation_sql"],
                     rule.get("status", "DRAFT"),
@@ -1522,9 +1925,10 @@ class SnowflakePlatformClient:
             cur.execute(
                 f"""
                 INSERT INTO {self._meta_prefix}.RBT_TEST_RULES
-                (RULE_ID, TEAM_ID, DOMAIN_ID, RISK_NAME, RISK_CATEGORY, RISK_PRIORITY, BUSINESS_IMPACT_DESC,
+                (RULE_ID, TEAM_ID, DOMAIN_ID, RISK_NAME, RISK_CATEGORY, RISK_PRIORITY,
+                 LIKELIHOOD_SCORE, IMPACT_SCORE, RISK_SCORE, BUSINESS_IMPACT_DESC,
                  VALIDATION_SQL, STATUS, LAST_COMPILE_ERROR, IS_SHARED_TEMPLATE, CREATED_BY, APPROVED_BY)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     rule_id,
@@ -1532,7 +1936,10 @@ class SnowflakePlatformClient:
                     rule["domain_id"],
                     rule["risk_name"],
                     rule.get("risk_category"),
-                    rule["risk_priority"],
+                    risk_priority,
+                    likelihood,
+                    impact,
+                    risk_score,
                     rule.get("business_impact_desc"),
                     rule["validation_sql"],
                     rule.get("status", "DRAFT"),
@@ -1556,6 +1963,17 @@ class SnowflakePlatformClient:
         assert existing is not None
         now = _utcnow_iso()
 
+        updates = dict(updates)
+        if "likelihood_score" in updates or "impact_score" in updates:
+            new_l = int(updates.get("likelihood_score") or existing.get("LIKELIHOOD_SCORE") or 3)
+            new_i = int(updates.get("impact_score") or existing.get("IMPACT_SCORE") or 3)
+            new_score = new_l * new_i
+            updates["likelihood_score"] = new_l
+            updates["impact_score"] = new_i
+            updates["risk_score"] = new_score
+            if "risk_priority" not in updates or updates["risk_priority"] is None:
+                updates["risk_priority"] = map_risk_score_to_priority(new_score)
+
         status_old = existing["STATUS"]
         status_new = updates.get("status", status_old)
         sql_old = existing["VALIDATION_SQL"]
@@ -1568,6 +1986,9 @@ class SnowflakePlatformClient:
                 "risk_name": "RISK_NAME",
                 "risk_category": "RISK_CATEGORY",
                 "risk_priority": "RISK_PRIORITY",
+                "likelihood_score": "LIKELIHOOD_SCORE",
+                "impact_score": "IMPACT_SCORE",
+                "risk_score": "RISK_SCORE",
                 "business_impact_desc": "BUSINESS_IMPACT_DESC",
                 "validation_sql": "VALIDATION_SQL",
                 "status": "STATUS",
@@ -1605,6 +2026,9 @@ class SnowflakePlatformClient:
                 "risk_name": "RISK_NAME",
                 "risk_category": "RISK_CATEGORY",
                 "risk_priority": "RISK_PRIORITY",
+                "likelihood_score": "LIKELIHOOD_SCORE",
+                "impact_score": "IMPACT_SCORE",
+                "risk_score": "RISK_SCORE",
                 "business_impact_desc": "BUSINESS_IMPACT_DESC",
                 "validation_sql": "VALIDATION_SQL",
                 "status": "STATUS",
@@ -1698,6 +2122,38 @@ class SnowflakePlatformClient:
     # Rule SQL Execution (Dry-Run & Gate Execution)
     # -----------------------------------------------------------------------
 
+    def _resolve_dataset_fqns(
+        self,
+        team: Dict[str, Any],
+        domain: Dict[str, Any],
+        target_schema_override: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Return (target_fqn, baseline_fqn) with sqlglot identifier sanitization."""
+        if settings.SNOWFLAKE_MOCK_MODE:
+            baseline_fqn = domain["TARGET_TABLE"]
+            if not target_schema_override or not target_schema_override.strip():
+                return baseline_fqn, baseline_fqn
+            safe_override = sanitize_sql_identifier(target_schema_override, "target_schema_override")
+            leaf = safe_override.split(".")[-1]
+            for candidate in (f"{leaf}_{domain['TARGET_TABLE']}", leaf):
+                if self._mock_fetchall(f"PRAGMA table_info({candidate})"):
+                    return candidate, baseline_fqn
+            return baseline_fqn, baseline_fqn
+
+        baseline_fqn = f"{team['SNOWFLAKE_DATABASE']}.{domain['TARGET_SCHEMA']}.{domain['TARGET_TABLE']}"
+        if not target_schema_override or not target_schema_override.strip():
+            return baseline_fqn, baseline_fqn
+
+        safe_override = sanitize_sql_identifier(target_schema_override, "target_schema_override")
+        parts = safe_override.split(".")
+        if len(parts) == 3:
+            target_fqn = safe_override
+        elif len(parts) == 2:
+            target_fqn = f"{safe_override}.{domain['TARGET_TABLE']}"
+        else:
+            target_fqn = f"{team['SNOWFLAKE_DATABASE']}.{safe_override}.{domain['TARGET_TABLE']}"
+        return target_fqn, baseline_fqn
+
     async def execute_rule_sql(
         self,
         sql: str,
@@ -1706,13 +2162,12 @@ class SnowflakePlatformClient:
         planning_cycle_id: Optional[str] = None,
         snapshot_ts: Optional[str] = None,
         capture_transient_detail_id: Optional[str] = None,
+        target_schema_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute a validated rule SQL query and return count, top 5 samples, and optional transient table ref."""
         started = time.perf_counter()
-        target_fqn = (
-            domain["TARGET_TABLE"]
-            if settings.SNOWFLAKE_MOCK_MODE
-            else f"{team['SNOWFLAKE_DATABASE']}.{domain['TARGET_SCHEMA']}.{domain['TARGET_TABLE']}"
+        target_fqn, baseline_fqn = self._resolve_dataset_fqns(
+            team, domain, target_schema_override=target_schema_override
         )
 
         wrapped_sql, params = wrap_with_target_dataset_cte(
@@ -1723,6 +2178,7 @@ class SnowflakePlatformClient:
             planning_cycle_id=planning_cycle_id,
             snapshot_ts=snapshot_ts,
             max_hierarchy_depth=domain.get("MAX_HIERARCHY_DEPTH", 10),
+            baseline_fqn=baseline_fqn,
         )
 
         if settings.SNOWFLAKE_MOCK_MODE:
@@ -1806,13 +2262,22 @@ class SnowflakePlatformClient:
         triggered_by: str,
         planning_cycle_id: Optional[str],
         snapshot_ts: Optional[str],
+        environment: str = "PROD",
+        target_schema_override: Optional[str] = None,
     ) -> str:
         run_id = _new_id("run")
         now = _utcnow_iso()
         if settings.SNOWFLAKE_MOCK_MODE:
             self._mock_execute(
-                "INSERT INTO RBT_EXECUTION_RUNS VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, team_id, domain_id, triggered_by, "RUNNING", planning_cycle_id, snapshot_ts, "PENDING", 0, 0, 0, None, None, None, None, now, None),
+                """
+                INSERT INTO RBT_EXECUTION_RUNS
+                (RUN_ID, TEAM_ID, DOMAIN_ID, TRIGGERED_BY, EXECUTION_STATUS, PLANNING_CYCLE_ID, SNAPSHOT_TS,
+                 GATE_DECISION, TOTAL_RULES_RUN, P1_FAILURES, P2_FAILURES, ENVIRONMENT, TARGET_SCHEMA_OVERRIDE,
+                 COVERAGE_PCT, RELEASE_CONFIDENCE_SCORE, SCHEMA_DRIFT_STATUS, SCHEMA_DRIFT_DETAILS,
+                 AI_TRIAGE_SUMMARY, OVERRIDE_BY, OVERRIDE_REASON, OVERRIDE_TS, RUN_TS, COMPLETED_TS)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, team_id, domain_id, triggered_by, "RUNNING", planning_cycle_id, snapshot_ts, "PENDING", 0, 0, 0, environment, target_schema_override, 0.0, 100.0, "PASS", "[]", None, None, None, None, now, None),
             )
             return run_id
         conn = self._get_live_connection()
@@ -1821,10 +2286,11 @@ class SnowflakePlatformClient:
             cur.execute(
                 f"""
                 INSERT INTO {self._meta_prefix}.RBT_EXECUTION_RUNS
-                (RUN_ID, TEAM_ID, DOMAIN_ID, TRIGGERED_BY, EXECUTION_STATUS, PLANNING_CYCLE_ID, SNAPSHOT_TS, GATE_DECISION)
-                VALUES (%s, %s, %s, %s, 'RUNNING', %s, %s, 'PENDING')
+                (RUN_ID, TEAM_ID, DOMAIN_ID, TRIGGERED_BY, EXECUTION_STATUS, PLANNING_CYCLE_ID, SNAPSHOT_TS,
+                 GATE_DECISION, ENVIRONMENT, TARGET_SCHEMA_OVERRIDE)
+                VALUES (%s, %s, %s, %s, 'RUNNING', %s, %s, 'PENDING', %s, %s)
                 """,
-                (run_id, team_id, domain_id, triggered_by, planning_cycle_id, snapshot_ts),
+                (run_id, team_id, domain_id, triggered_by, planning_cycle_id, snapshot_ts, environment, target_schema_override),
             )
             return run_id
         finally:
@@ -1840,17 +2306,37 @@ class SnowflakePlatformClient:
         p2_failures: int,
         ai_triage_summary: Optional[str],
         details: List[Dict[str, Any]],
+        coverage_pct: float = 0.0,
+        release_confidence_score: float = 100.0,
+        schema_drift_status: str = "PASS",
+        schema_drift_details: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         now = _utcnow_iso()
+        drift_json = json.dumps(schema_drift_details or [], default=str)
         if settings.SNOWFLAKE_MOCK_MODE:
             self._mock_execute(
                 """
                 UPDATE RBT_EXECUTION_RUNS
                 SET EXECUTION_STATUS = ?, GATE_DECISION = ?, TOTAL_RULES_RUN = ?,
-                    P1_FAILURES = ?, P2_FAILURES = ?, AI_TRIAGE_SUMMARY = ?, COMPLETED_TS = ?
+                    P1_FAILURES = ?, P2_FAILURES = ?, COVERAGE_PCT = ?, RELEASE_CONFIDENCE_SCORE = ?,
+                    SCHEMA_DRIFT_STATUS = ?, SCHEMA_DRIFT_DETAILS = ?,
+                    AI_TRIAGE_SUMMARY = ?, COMPLETED_TS = ?
                 WHERE RUN_ID = ?
                 """,
-                (execution_status, gate_decision, total_rules_run, p1_failures, p2_failures, ai_triage_summary, now, run_id),
+                (
+                    execution_status,
+                    gate_decision,
+                    total_rules_run,
+                    p1_failures,
+                    p2_failures,
+                    coverage_pct,
+                    release_confidence_score,
+                    schema_drift_status,
+                    drift_json,
+                    ai_triage_summary,
+                    now,
+                    run_id,
+                ),
             )
             assert self._conn is not None
             with self._lock:
@@ -1884,10 +2370,24 @@ class SnowflakePlatformClient:
                 f"""
                 UPDATE {self._meta_prefix}.RBT_EXECUTION_RUNS
                 SET EXECUTION_STATUS = %s, GATE_DECISION = %s, TOTAL_RULES_RUN = %s,
-                    P1_FAILURES = %s, P2_FAILURES = %s, AI_TRIAGE_SUMMARY = %s, COMPLETED_TS = CURRENT_TIMESTAMP()
+                    P1_FAILURES = %s, P2_FAILURES = %s, COVERAGE_PCT = %s, RELEASE_CONFIDENCE_SCORE = %s,
+                    SCHEMA_DRIFT_STATUS = %s, SCHEMA_DRIFT_DETAILS = PARSE_JSON(%s),
+                    AI_TRIAGE_SUMMARY = %s, COMPLETED_TS = CURRENT_TIMESTAMP()
                 WHERE RUN_ID = %s
                 """,
-                (execution_status, gate_decision, total_rules_run, p1_failures, p2_failures, ai_triage_summary, run_id),
+                (
+                    execution_status,
+                    gate_decision,
+                    total_rules_run,
+                    p1_failures,
+                    p2_failures,
+                    coverage_pct,
+                    release_confidence_score,
+                    schema_drift_status,
+                    drift_json,
+                    ai_triage_summary,
+                    run_id,
+                ),
             )
             for d in details:
                 cur.execute(

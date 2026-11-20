@@ -17,7 +17,7 @@ from app.schemas.models import (
     RuleOut,
     RuleUpdate,
 )
-from app.security.sql_validator import SQLValidationError, validate_readonly_sql
+from app.security.sql_validator import SQLValidationError, sanitize_sql_identifier, validate_readonly_sql
 
 router = APIRouter(prefix="/api/v1", tags=["Rules & Marketplace"])
 
@@ -137,6 +137,8 @@ async def dry_run_rule(
 
     try:
         validate_readonly_sql(sql_to_test, max_hierarchy_depth=max_depth)
+        if payload.target_schema_override and payload.target_schema_override.strip():
+            sanitize_sql_identifier(payload.target_schema_override, "target_schema_override")
     except SQLValidationError as exc:
         return RuleDryRunResponse(
             rule_id=rule_id,
@@ -152,6 +154,7 @@ async def dry_run_rule(
             domain=domain,
             planning_cycle_id=payload.planning_cycle_id,
             snapshot_ts=payload.snapshot_ts,
+            target_schema_override=payload.target_schema_override,
         )
         return RuleDryRunResponse(
             rule_id=rule_id,
@@ -186,6 +189,9 @@ async def list_marketplace(
             risk_name=r["RISK_NAME"],
             risk_category=r.get("RISK_CATEGORY"),
             risk_priority=r["RISK_PRIORITY"],
+            likelihood_score=int(r.get("LIKELIHOOD_SCORE") or 3),
+            impact_score=int(r.get("IMPACT_SCORE") or 3),
+            risk_score=int(r.get("RISK_SCORE") or (int(r.get("LIKELIHOOD_SCORE") or 3) * int(r.get("IMPACT_SCORE") or 3))),
             business_impact_desc=r.get("BUSINESS_IMPACT_DESC"),
             validation_sql=r["VALIDATION_SQL"],
             approved_by=r.get("APPROVED_BY"),
@@ -243,6 +249,8 @@ async def clone_marketplace_template(
             "risk_name": checked["risk_name"],
             "risk_category": checked["risk_category"],
             "risk_priority": checked["risk_priority"],
+            "likelihood_score": int(template.get("LIKELIHOOD_SCORE") or 3),
+            "impact_score": int(template.get("IMPACT_SCORE") or 3),
             "business_impact_desc": checked["business_impact_desc"],
             "validation_sql": checked["validation_sql"],
             "status": checked["status"],

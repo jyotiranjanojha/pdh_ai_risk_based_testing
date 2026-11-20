@@ -12,13 +12,21 @@ from app.schemas.models import (
     CurrentUser,
     GroundingContext,
     RuleOut,
+    map_risk_score_to_priority,
 )
-from app.security.sql_validator import SQLValidationError, validate_readonly_sql
+from app.security.sql_validator import (
+    SQLValidationError,
+    extract_sql_lineage_summary,
+    validate_readonly_sql,
+)
 
 router = APIRouter(prefix="/api/v1/domains", tags=["Cortex AI Discovery"])
 
 
 def row_to_rule_out(row: dict) -> RuleOut:
+    likelihood = int(row.get("LIKELIHOOD_SCORE") or 3)
+    impact = int(row.get("IMPACT_SCORE") or 3)
+    risk_score = int(row.get("RISK_SCORE") or (likelihood * impact))
     return RuleOut(
         rule_id=row["RULE_ID"],
         team_id=row["TEAM_ID"],
@@ -27,6 +35,9 @@ def row_to_rule_out(row: dict) -> RuleOut:
         risk_name=row["RISK_NAME"],
         risk_category=row.get("RISK_CATEGORY"),
         risk_priority=row["RISK_PRIORITY"],
+        likelihood_score=likelihood,
+        impact_score=impact,
+        risk_score=risk_score,
         business_impact_desc=row.get("BUSINESS_IMPACT_DESC"),
         validation_sql=row["VALIDATION_SQL"],
         status=row["STATUS"],
@@ -121,6 +132,36 @@ async def ai_discover_rules(
         f"Step 3: Computed non-PII statistical profiles across {sum(p.row_count for p in grounding.profiles)} rows",
     ]
 
+    upstream_table = domain.get("UPSTREAM_SOURCE_TABLE")
+    transformation_sql = domain.get("TRANSFORMATION_SQL")
+    pr_sql_diff = payload.pr_sql_diff if payload else None
+
+    extra_sections: List[str] = []
+    if upstream_table:
+        steps.append(f"Step 4: Grounded upstream source table '{upstream_table}' for pipeline reconciliation")
+        extra_sections.append(
+            f"UPSTREAM_SOURCE_TABLE: {upstream_table}\n"
+            f"Also generate a PIPELINE_RECONCILIATION rule comparing row counts and key-metric sums "
+            f"between {upstream_table} and __TARGET_DATASET__."
+        )
+
+    combined_sql_context = "\n\n".join(x for x in (transformation_sql, pr_sql_diff) if x and x.strip())
+    if combined_sql_context:
+        lineage = extract_sql_lineage_summary(combined_sql_context)
+        steps.append(
+            f"Step 5: Parsed transformation/PR-diff SQL lineage ({len(lineage.get('tables', []))} tables, "
+            f"{len(lineage.get('joins', []))} joins, {len(lineage.get('filters', []))} filters, "
+            f"{lineage.get('case_branches', 0)} CASE branches)"
+        )
+        if transformation_sql:
+            extra_sections.append(f"TRANSFORMATION_SQL:\n{transformation_sql[:2500]}")
+        if pr_sql_diff:
+            extra_sections.append(f"PR_SQL_DIFF:\n{pr_sql_diff[:2500]}")
+        extra_sections.append(
+            f"Parsed SQL Lineage Summary: {json.dumps(lineage)}\n"
+            f"Generate targeted edge-case rules for modified JOINs, WHERE filters, aggregations, and CASE WHEN branches."
+        )
+
     prompt = (
         f"You are an Enterprise Snowflake Data Quality & Risk-Based Testing Architect.\n"
         f"Dataset: {domain['DOMAIN_NAME']} ({domain['TARGET_SCHEMA']}.{domain['TARGET_TABLE']})\n"
@@ -129,10 +170,11 @@ async def ai_discover_rules(
         f"Temporal Cycle Column: {domain.get('TEMPORAL_CYCLE_COLUMN')}\n"
         f"Max Hierarchy Depth: {domain.get('MAX_HIERARCHY_DEPTH', 10)}\n"
         f"Grounding Metadata:\n{json.dumps(grounding.model_dump(), default=str)}\n\n"
-        f"Generate 5 to 8 Snowflake SQL validation rules referencing `__TARGET_DATASET__` "
+        + ("\n\n".join(extra_sections) + "\n\n" if extra_sections else "")
+        + f"Generate 5 to 8 Snowflake SQL validation rules referencing `__TARGET_DATASET__` "
         f"(0 rows returned = PASS). Include duplicate keys, referential integrity, "
         f"bounded recursive hierarchy loops (WHERE depth <= {domain.get('MAX_HIERARCHY_DEPTH', 10)}), "
-        f"and frozen-horizon/boundary checks."
+        f"frozen-horizon/boundary checks, and assign quantitative likelihood_score (1-5) and impact_score (1-5)."
     )
 
     chosen_model = payload.cortex_model if payload and payload.cortex_model else settings.CORTEX_MODEL
@@ -151,13 +193,18 @@ async def ai_discover_rules(
 
     for draft in cortex_result.get("generated_rules", []):
         checked = compile_and_auto_debug_rule(draft, team, domain, grounding, cortex_model=chosen_model)
+        l_score = int(checked.get("likelihood_score") or 3)
+        i_score = int(checked.get("impact_score") or 3)
+        computed_priority = checked.get("risk_priority") or map_risk_score_to_priority(l_score * i_score)
         row = sf_client.insert_rule(
             {
                 "team_id": team["TEAM_ID"],
                 "domain_id": domain_id,
                 "risk_name": checked["risk_name"],
                 "risk_category": checked["risk_category"],
-                "risk_priority": checked["risk_priority"],
+                "risk_priority": computed_priority,
+                "likelihood_score": l_score,
+                "impact_score": i_score,
                 "business_impact_desc": checked["business_impact_desc"],
                 "validation_sql": checked["validation_sql"],
                 "status": checked["status"],

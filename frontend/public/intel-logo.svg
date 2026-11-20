@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 48" fill="none">
+  <rect width="120" height="48" rx="10" fill="#0068B5"/>
+  <!-- Dot over the i (signature Intel cyan-white square/dot) -->
+  <rect x="20" y="10" width="6" height="6" rx="1" fill="#00C7FD"/>
+  <!-- "intel" wordmark -->
+  <text x="19" y="36" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="26" letter-spacing="-0.5">intel.</text>
+</svg>
